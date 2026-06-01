@@ -29,6 +29,9 @@ const int PANEL_W     = 264;
 #define WAVE_FORMAT_PCM 1
 #endif
 
+static const GUID SUBTYPE_PCM =
+    {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+
 static std::vector<BYTE>  g_Frame;
 static std::mutex         g_FrameLock;
 static SOCKET             g_Client = INVALID_SOCKET;
@@ -148,33 +151,55 @@ void AudioReceiverThread() {
         if(!RecvAll(cli,(char*)&sampleRate,4)||!RecvAll(cli,(char*)&channels,2)){
             closesocket(cli); continue;
         }
+        int inCh=channels; // remember what the client is actually sending
 
         CoInitialize(0);
-        WAVEFORMATEX wfx{};
-        wfx.wFormatTag=WAVE_FORMAT_PCM; wfx.nChannels=channels;
-        wfx.nSamplesPerSec=sampleRate; wfx.wBitsPerSample=16;
-        wfx.nBlockAlign=channels*2; wfx.nAvgBytesPerSec=sampleRate*wfx.nBlockAlign;
-
         IMMDeviceEnumerator* pEnum=NULL; IMMDevice* pDev=NULL;
         IAudioClient* pAC=NULL; IAudioRenderClient* pRC=NULL;
         HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,
                      __uuidof(IMMDeviceEnumerator),(void**)&pEnum);
         if(SUCCEEDED(hr)) hr=pEnum->GetDefaultAudioEndpoint(eRender,eConsole,&pDev);
         if(SUCCEEDED(hr)) hr=pDev->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
-        if(SUCCEEDED(hr)) hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfx,NULL);
 
-        // Fallback: try with system mix format
+        int outCh=channels; // will change if device forces us
+        WAVEFORMATEX wfx{};
+
+        // Try 1: plain PCM with client's exact format
+        if(SUCCEEDED(hr)){
+            wfx.wFormatTag=WAVE_FORMAT_PCM; wfx.nChannels=channels;
+            wfx.nSamplesPerSec=sampleRate; wfx.wBitsPerSample=16;
+            wfx.nBlockAlign=channels*2; wfx.nAvgBytesPerSec=sampleRate*wfx.nBlockAlign;
+            hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfx,NULL);
+        }
+
+        // Try 2: WAVEFORMATEXTENSIBLE (some devices require this)
+        if(FAILED(hr) && pAC){
+            WAVEFORMATEXTENSIBLE wfex{};
+            wfex.Format.wFormatTag=WAVE_FORMAT_EXTENSIBLE;
+            wfex.Format.nChannels=channels;
+            wfex.Format.nSamplesPerSec=sampleRate;
+            wfex.Format.wBitsPerSample=16;
+            wfex.Format.nBlockAlign=channels*2;
+            wfex.Format.nAvgBytesPerSec=sampleRate*channels*2;
+            wfex.Format.cbSize=22;
+            wfex.Samples.wValidBitsPerSample=16;
+            wfex.dwChannelMask=(channels==1)?0x4:0x3;
+            wfex.SubFormat=SUBTYPE_PCM;
+            hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfex.Format,NULL);
+        }
+
+        // Try 3: use device mix format, keep client's sample rate, adapt channels
         if(FAILED(hr) && pAC){
             WAVEFORMATEX* pMix=NULL;
             if(SUCCEEDED(pAC->GetMixFormat(&pMix))){
-                wfx=*pMix;
-                // Force to PCM 16-bit for our buffer writes
-                wfx.wBitsPerSample=16;
-                wfx.nBlockAlign=wfx.nChannels*2;
-                wfx.nAvgBytesPerSec=wfx.nSamplesPerSec*wfx.nBlockAlign;
-                wfx.wFormatTag=WAVE_FORMAT_PCM;
-                wfx.cbSize=0;
-                hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfx,NULL);
+                outCh=pMix->nChannels;
+                pMix->nSamplesPerSec=sampleRate;          // NEVER change this
+                pMix->nAvgBytesPerSec=sampleRate*pMix->nBlockAlign;
+                hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,pMix,NULL);
+                // update our wfx to match what we actually got
+                wfx.nChannels=outCh;
+                wfx.nBlockAlign=outCh*2;
+                wfx.nAvgBytesPerSec=sampleRate*wfx.nBlockAlign;
                 CoTaskMemFree(pMix);
             }
         }
@@ -188,7 +213,30 @@ void AudioReceiverThread() {
                 if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024) break;
                 std::vector<char> data(len);
                 if(!RecvAll(cli,data.data(),len)) break;
-                UINT32 frames=len/wfx.nBlockAlign;
+
+                // ── channel conversion if needed ──
+                int inFrames=len/(inCh*2);
+                std::vector<char> converted;
+                char* playData=data.data();
+                int playLen=len;
+
+                if(inCh!=outCh){
+                    int outLen=inFrames*outCh*2;
+                    converted.resize(outLen);
+                    short* inS=(short*)data.data();
+                    short* outS=(short*)converted.data();
+                    if(inCh==1 && outCh==2){
+                        for(int i=0;i<inFrames;i++){outS[i*2]=inS[i];outS[i*2+1]=inS[i];}
+                    } else if(inCh==2 && outCh==1){
+                        for(int i=0;i<inFrames;i++){outS[i]=(short)(((int)inS[i*2]+inS[i*2+1])/2);}
+                    } else {
+                        for(int i=0;i<inFrames*outCh&&i<inFrames*inCh;i++) outS[i]=inS[i];
+                    }
+                    playData=converted.data();
+                    playLen=outLen;
+                }
+
+                UINT32 frames=playLen/wfx.nBlockAlign;
                 for(int w=0;w<50;w++){
                     UINT32 pad; pAC->GetCurrentPadding(&pad);
                     if(bufFrames-pad>=frames) break;
@@ -200,7 +248,7 @@ void AudioReceiverThread() {
                 if(!frames) continue;
                 BYTE* pOut;
                 if(SUCCEEDED(pRC->GetBuffer(frames,&pOut))){
-                    memcpy(pOut,data.data(),frames*wfx.nBlockAlign);
+                    memcpy(pOut,playData,frames*wfx.nBlockAlign);
                     pRC->ReleaseBuffer(frames,0);
                 }
             }
@@ -229,7 +277,7 @@ void DevListReceiverThread() {
         for(int i=0;i<count&&i<32;i++){
             int nl;
             if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>512) break;
-            if(nl==0){ devs.push_back("(unknown)"); continue; }
+            if(nl==0){devs.push_back("(unknown)");continue;}
             std::vector<char> nm(nl+1); if(!RecvAll(cli,nm.data(),nl)) break;
             nm[nl]=0; devs.push_back(std::string(nm.data()));
         }

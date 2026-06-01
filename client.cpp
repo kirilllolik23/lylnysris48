@@ -69,7 +69,6 @@ bool IsFloatFmt(WAVEFORMATEX* pw){
         return ((WAVEFORMATEXTENSIBLE*)pw)->SubFormat==s_SUBTYPE_FLOAT;
     return false;
 }
-
 bool IsPcmFmt(WAVEFORMATEX* pw){
     if(pw->wFormatTag==WAVE_FORMAT_PCM) return true;
     if(pw->wFormatTag==WAVE_FORMAT_EXTENSIBLE)
@@ -80,7 +79,6 @@ bool IsPcmFmt(WAVEFORMATEX* pw){
 void CaptureAndStream(bool systemAudio, int micDevIdx){
     g_CaptureRunning=true;
 
-    // ── connect with retry (server may still be closing old connection) ──
     SOCKET sock=INVALID_SOCKET;
     for(int attempt=0; attempt<15; attempt++){
         if(g_StopCapture) break;
@@ -112,7 +110,7 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
                 if(micDevIdx>=0 && micDevIdx<(int)cnt)
                     hr=pC->Item(micDevIdx,&pD);
                 else if(cnt>0)
-                    hr=pC->Item(0,&pD);   // fallback to first device
+                    hr=pC->Item(0,&pD);
                 else
                     hr=E_FAIL;
                 pC->Release();
@@ -125,22 +123,24 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
 
     DWORD flags=systemAudio?AUDCLNT_STREAMFLAGS_LOOPBACK:0;
     if(SUCCEEDED(hr)) hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,flags,20000000,0,pwfx,NULL);
-
     if(SUCCEEDED(hr)) hr=pAC->GetService(__uuidof(IAudioCaptureClient),(void**)&pCC);
 
     if(SUCCEEDED(hr) && pwfx){
-        int sr=pwfx->nSamplesPerSec; short ch=pwfx->nChannels;
+        int sr=pwfx->nSamplesPerSec;
+        short ch=pwfx->nChannels;
         bool isF=IsFloatFmt(pwfx);
         bool isP=IsPcmFmt(pwfx);
         int bps=pwfx->wBitsPerSample;
 
-        send(sock,(char*)&sr,4,0); send(sock,(char*)&ch,2,0);
+        // ── send header reliably ──
+        if(!SendAll(sock,(char*)&sr,4)||!SendAll(sock,(char*)&ch,2)){
+            goto cleanup;
+        }
 
         hr=pAC->Start();
         if(SUCCEEDED(hr)){
             bool connected=true;
             while(!g_StopCapture && connected){
-                // drain all available packets
                 while(!g_StopCapture){
                     UINT32 pkt;
                     hr=pCC->GetNextPacketSize(&pkt);
@@ -158,17 +158,19 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
                     } else if(isF){
                         float* f=(float*)pData;
                         for(int i=0;i<total;i++){
-                            float v=f[i]; if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
-                            pcm[i]=(short)(v*32767.f);
+                            float v=f[i];
+                            if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
+                            pcm[i]=(short)(v*32767.f * 0.85f);
                         }
                     } else if(isP && bps==16){
-                        memcpy(pcm.data(),pData,pcmLen);
+                        for(int i=0;i<total;i++)
+                            pcm[i]=(short)(((int)pData[i*2]|((int)(pData[i*2+1])<<8))-32768);
+                        // apply gain
+                        for(int i=0;i<total;i++) pcm[i]=(short)(pcm[i]*0.85f);
                     } else if(isP && bps==32){
-                        // 32-bit PCM → 16-bit
                         int32_t* s32=(int32_t*)pData;
-                        for(int i=0;i<total;i++) pcm[i]=(short)(s32[i]>>16);
+                        for(int i=0;i<total;i++) pcm[i]=(short)((s32[i]>>16)*0.85f);
                     } else if(isP && bps==24){
-                        // 24-bit PCM → 16-bit
                         BYTE* p24=(BYTE*)pData;
                         for(int i=0;i<total;i++){
                             int32_t v=(int32_t)(
@@ -176,18 +178,30 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
                                 ((uint32_t)p24[i*3+1])<<8|
                                 ((uint32_t)p24[i*3+2])<<16);
                             if(v&0x800000) v|=0xFF000000;
-                            pcm[i]=(short)(v>>8);
+                            pcm[i]=(short)((v>>8)*0.85f);
                         }
+                    } else if(isP && bps==8){
+                        BYTE* p8=(BYTE*)pData;
+                        for(int i=0;i<total;i++)
+                            pcm[i]=(short)(((int)p8[i]-128)*256*0.85f);
                     } else {
-                        // unknown format — try as float as last resort
+                        // last resort: try as float
                         float* f=(float*)pData;
                         for(int i=0;i<total;i++){
-                            float v=f[i]; if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
-                            pcm[i]=(short)(v*32767.f);
+                            float v=f[i];
+                            if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
+                            pcm[i]=(short)(v*32767.f * 0.85f);
                         }
                     }
 
                     pCC->ReleaseBuffer(nF);
+
+                    // ── noise gate: kill quiet frames ──
+                    int64_t sum=0;
+                    for(int i=0;i<total;i++) sum+=(int64_t)pcm[i]*pcm[i];
+                    if(sum/total < 90000) // threshold ~300/32767
+                        memset(pcm.data(),0,pcmLen);
+
                     if(!SendAll(sock,(char*)&pcmLen,4)||!SendAll(sock,(char*)pcm.data(),pcmLen))
                         connected=false;
                 }
@@ -197,6 +211,7 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
         }
     }
 
+cleanup:
     if(pwfx) CoTaskMemFree(pwfx);
     if(pCC) pCC->Release(); if(pAC) pAC->Release();
     if(pD) pD->Release(); if(pE) pE->Release();
