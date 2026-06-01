@@ -27,6 +27,6 @@ jobs:
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: Nyx-RAT-Builds
+        name: Nyx-Builds
         path: |
           *.exe
