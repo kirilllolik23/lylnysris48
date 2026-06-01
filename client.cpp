@@ -27,13 +27,14 @@ const int PORT_DEVS   = 4446;
 
 static const GUID s_SUBTYPE_FLOAT =
     {0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
+static const GUID s_SUBTYPE_PCM   =
+    {0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
 static const PROPERTYKEY s_PKEY_FriendlyName =
     {{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}},14};
 
 static std::atomic<bool> g_CaptureRunning{false};
 static std::atomic<bool> g_StopCapture{false};
 
-// ── volume ──
 void SetVolume(int vol){
     CoInitialize(0);
     IMMDeviceEnumerator* pE=0; IMMDevice* pD=0; IAudioEndpointVolume* pV=0;
@@ -46,7 +47,6 @@ void SetVolume(int vol){
     CoUninitialize();
 }
 
-// ── gdi+ ──
 int GetEncoderClsid(const WCHAR* mime,CLSID* clsid){
     UINT num=0,size=0; Gdiplus::GetImageEncodersSize(&num,&size);
     if(!size) return -1;
@@ -56,7 +56,6 @@ int GetEncoderClsid(const WCHAR* mime,CLSID* clsid){
     free(p); return -1;
 }
 
-// ── network ──
 bool SendAll(SOCKET s,const char* d,int len){
     int t=0; while(t<len){int n=send(s,d+t,len-t,0);if(n<=0)return false;t+=n;} return true;
 }
@@ -64,7 +63,6 @@ bool RecvAll(SOCKET s,char* d,int len){
     int t=0; while(t<len){int n=recv(s,d+t,len-t,0);if(n<=0)return false;t+=n;} return true;
 }
 
-// ── audio capture & stream ──
 bool IsFloatFmt(WAVEFORMATEX* pw){
     if(pw->wFormatTag==WAVE_FORMAT_IEEE_FLOAT) return true;
     if(pw->wFormatTag==WAVE_FORMAT_EXTENSIBLE)
@@ -72,13 +70,29 @@ bool IsFloatFmt(WAVEFORMATEX* pw){
     return false;
 }
 
+bool IsPcmFmt(WAVEFORMATEX* pw){
+    if(pw->wFormatTag==WAVE_FORMAT_PCM) return true;
+    if(pw->wFormatTag==WAVE_FORMAT_EXTENSIBLE)
+        return ((WAVEFORMATEXTENSIBLE*)pw)->SubFormat==s_SUBTYPE_PCM;
+    return false;
+}
+
 void CaptureAndStream(bool systemAudio, int micDevIdx){
     g_CaptureRunning=true;
 
-    SOCKET sock=socket(AF_INET,SOCK_STREAM,0);
-    sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(PORT_AUDIO);
-    inet_pton(AF_INET,SERVER_IP,&addr.sin_addr);
-    if(connect(sock,(sockaddr*)&addr,sizeof(addr))!=0){closesocket(sock);g_CaptureRunning=false;return;}
+    // ── connect with retry (server may still be closing old connection) ──
+    SOCKET sock=INVALID_SOCKET;
+    for(int attempt=0; attempt<15; attempt++){
+        if(g_StopCapture) break;
+        sock=socket(AF_INET,SOCK_STREAM,0);
+        if(sock==INVALID_SOCKET) break;
+        sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(PORT_AUDIO);
+        inet_pton(AF_INET,SERVER_IP,&addr.sin_addr);
+        if(connect(sock,(sockaddr*)&addr,sizeof(addr))==0) break;
+        closesocket(sock); sock=INVALID_SOCKET;
+        Sleep(400);
+    }
+    if(sock==INVALID_SOCKET){g_CaptureRunning=false;return;}
 
     CoInitialize(0);
     IMMDeviceEnumerator* pE=NULL; IMMDevice* pD=NULL;
@@ -86,6 +100,7 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
 
     HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,
                  __uuidof(IMMDeviceEnumerator),(void**)&pE);
+
     if(SUCCEEDED(hr)){
         if(systemAudio){
             hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);
@@ -94,48 +109,92 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
             hr=pE->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&pC);
             if(SUCCEEDED(hr)){
                 UINT cnt; pC->GetCount(&cnt);
-                hr=(micDevIdx<(int)cnt)?pC->Item(micDevIdx,&pD):E_FAIL;
+                if(micDevIdx>=0 && micDevIdx<(int)cnt)
+                    hr=pC->Item(micDevIdx,&pD);
+                else if(cnt>0)
+                    hr=pC->Item(0,&pD);   // fallback to first device
+                else
+                    hr=E_FAIL;
                 pC->Release();
             }
         }
     }
-    if(SUCCEEDED(hr)) hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
+
+    if(SUCCEEDED(hr) && pD) hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
     if(SUCCEEDED(hr)) hr=pAC->GetMixFormat(&pwfx);
 
     DWORD flags=systemAudio?AUDCLNT_STREAMFLAGS_LOOPBACK:0;
-    if(SUCCEEDED(hr)) hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,flags,10000000,0,pwfx,NULL);
+    if(SUCCEEDED(hr)) hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,flags,20000000,0,pwfx,NULL);
+
     if(SUCCEEDED(hr)) hr=pAC->GetService(__uuidof(IAudioCaptureClient),(void**)&pCC);
 
-    if(SUCCEEDED(hr)){
+    if(SUCCEEDED(hr) && pwfx){
         int sr=pwfx->nSamplesPerSec; short ch=pwfx->nChannels;
         bool isF=IsFloatFmt(pwfx);
-        send(sock,(char*)&sr,4,0); send(sock,(char*)&ch,2,0);
-        pAC->Start();
+        bool isP=IsPcmFmt(pwfx);
+        int bps=pwfx->wBitsPerSample;
 
-        while(!g_StopCapture){
-            UINT32 pkt; hr=pCC->GetNextPacketSize(&pkt);
-            if(FAILED(hr)) break;
-            if(pkt==0){Sleep(5);continue;}
-            BYTE* pData; UINT32 nF; DWORD bf;
-            hr=pCC->GetBuffer(&pData,&nF,&bf,NULL,NULL);
-            if(FAILED(hr)) break;
-            int total=nF*ch, pcmLen=total*2;
-            std::vector<short> pcm(total);
-            if(bf&AUDCLNT_BUFFERFLAGS_SILENT){
-                memset(pcm.data(),0,pcmLen);
-            } else if(isF){
-                float* f=(float*)pData;
-                for(int i=0;i<total;i++){
-                    float v=f[i]; if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
-                    pcm[i]=(short)(v*32767.f);
+        send(sock,(char*)&sr,4,0); send(sock,(char*)&ch,2,0);
+
+        hr=pAC->Start();
+        if(SUCCEEDED(hr)){
+            bool connected=true;
+            while(!g_StopCapture && connected){
+                // drain all available packets
+                while(!g_StopCapture){
+                    UINT32 pkt;
+                    hr=pCC->GetNextPacketSize(&pkt);
+                    if(FAILED(hr)||pkt==0) break;
+
+                    BYTE* pData; UINT32 nF; DWORD bf;
+                    hr=pCC->GetBuffer(&pData,&nF,&bf,NULL,NULL);
+                    if(FAILED(hr)) break;
+
+                    int total=nF*ch, pcmLen=total*2;
+                    std::vector<short> pcm(total);
+
+                    if(bf & AUDCLNT_BUFFERFLAGS_SILENT){
+                        memset(pcm.data(),0,pcmLen);
+                    } else if(isF){
+                        float* f=(float*)pData;
+                        for(int i=0;i<total;i++){
+                            float v=f[i]; if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
+                            pcm[i]=(short)(v*32767.f);
+                        }
+                    } else if(isP && bps==16){
+                        memcpy(pcm.data(),pData,pcmLen);
+                    } else if(isP && bps==32){
+                        // 32-bit PCM → 16-bit
+                        int32_t* s32=(int32_t*)pData;
+                        for(int i=0;i<total;i++) pcm[i]=(short)(s32[i]>>16);
+                    } else if(isP && bps==24){
+                        // 24-bit PCM → 16-bit
+                        BYTE* p24=(BYTE*)pData;
+                        for(int i=0;i<total;i++){
+                            int32_t v=(int32_t)(
+                                (uint32_t)p24[i*3]|
+                                ((uint32_t)p24[i*3+1])<<8|
+                                ((uint32_t)p24[i*3+2])<<16);
+                            if(v&0x800000) v|=0xFF000000;
+                            pcm[i]=(short)(v>>8);
+                        }
+                    } else {
+                        // unknown format — try as float as last resort
+                        float* f=(float*)pData;
+                        for(int i=0;i<total;i++){
+                            float v=f[i]; if(v>1.f)v=1.f; if(v<-1.f)v=-1.f;
+                            pcm[i]=(short)(v*32767.f);
+                        }
+                    }
+
+                    pCC->ReleaseBuffer(nF);
+                    if(!SendAll(sock,(char*)&pcmLen,4)||!SendAll(sock,(char*)pcm.data(),pcmLen))
+                        connected=false;
                 }
-            } else if(pwfx->wBitsPerSample==16){
-                memcpy(pcm.data(),pData,pcmLen);
-            } else { memset(pcm.data(),0,pcmLen); }
-            pCC->ReleaseBuffer(nF);
-            if(!SendAll(sock,(char*)&pcmLen,4)||!SendAll(sock,(char*)pcm.data(),pcmLen)) break;
+                if(connected) Sleep(5);
+            }
+            pAC->Stop();
         }
-        pAC->Stop();
     }
 
     if(pwfx) CoTaskMemFree(pwfx);
@@ -146,7 +205,6 @@ void CaptureAndStream(bool systemAudio, int micDevIdx){
     g_CaptureRunning=false;
 }
 
-// ── device list ──
 void SendDeviceList(){
     SOCKET sock=socket(AF_INET,SOCK_STREAM,0);
     sockaddr_in addr{}; addr.sin_family=AF_INET; addr.sin_port=htons(PORT_DEVS);
@@ -178,7 +236,6 @@ void SendDeviceList(){
     closesocket(sock);
 }
 
-// ── command listener ──
 void CommandListener(SOCKET s){
     while(true){
         char cmd; if(recv(s,&cmd,1,0)!=1) break;
@@ -222,7 +279,6 @@ void CommandListener(SOCKET s){
     }
 }
 
-// ── main ──
 int main(){
     SetProcessDPIAware();
 
