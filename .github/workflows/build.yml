@@ -7,26 +7,16 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Setup MSVC Compiler
-      uses: ilammy/msvc-dev-cmd@v1
+    - uses: ilammy/msvc-dev-cmd@v1
       with:
         arch: amd64
-    
     - name: Build Client
-      run: |
-        cl /EHsc /O2 client.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib winmm.lib ws2_32.lib ole32.lib
-    
+      run: cl /EHsc /O2 client.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib winmm.lib ws2_32.lib ole32.lib
     - name: Build Server
-      run: |
-        cl /EHsc /O2 server.cpp /link ws2_32.lib user32.lib gdi32.lib ole32.lib comctl32.lib
-    
-    - name: Upload Artifacts
-      uses: actions/upload-artifact@v4
+      run: cl /EHsc /O2 server.cpp /link ws2_32.lib user32.lib gdi32.lib ole32.lib comctl32.lib
+    - uses: actions/upload-artifact@v4
       with:
         name: Nyx-Builds
-        path: |
-          *.exe
+        path: "*.exe"
