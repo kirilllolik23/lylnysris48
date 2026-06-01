@@ -167,7 +167,8 @@ void SendDeviceList(){
         PROPVARIANT nm; ZeroMemory(&nm,sizeof(nm));
         pS->GetValue(s_PKEY_FriendlyName,&nm);
         char buf[256]={};
-        if(nm.vt==VT_LPWSTR&&nm.pwszVal) wcstombs(buf,nm.pwszVal,255);
+        if(nm.vt==VT_LPWSTR&&nm.pwszVal)
+            WideCharToMultiByte(CP_ACP,0,nm.pwszVal,-1,buf,255,"?",NULL);
         int len=(int)strlen(buf);
         SendAll(sock,(char*)&len,4); SendAll(sock,buf,len);
         if(nm.vt==VT_LPWSTR&&nm.pwszVal) CoTaskMemFree(nm.pwszVal);
@@ -193,6 +194,9 @@ void CommandListener(SOCKET s){
             std::ofstream out(f,std::ios::binary); out.write(buf.data(),sz); out.close();
             mciSendStringA(("open \""+f+"\" type mpegvideo alias nyx").c_str(),0,0,0);
             mciSendStringA("play nyx",0,0,0);
+        }
+        else if(cmd=='S'){
+            mciSendStringA("close nyx",0,0,0);
         }
         else if(cmd=='A'){
             char on; if(recv(s,&on,1,0)!=1) break;

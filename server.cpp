@@ -36,7 +36,7 @@ static SOCKET             g_Client = INVALID_SOCKET;
 static std::mutex         g_SockLock;
 
 // ── ui ──
-static HWND g_hWnd, g_hSlider, g_hListBox, g_hPlayBtn, g_hStatus;
+static HWND g_hWnd, g_hSlider, g_hListBox, g_hPlayBtn, g_hStopBtn, g_hStatus;
 static HWND g_hPcAudioChk, g_hMicChk, g_hMicCombo;
 static std::vector<std::string> g_Sounds;
 static std::vector<std::string> g_MicDevs;
@@ -51,11 +51,12 @@ static const COLORREF C_DIM    = RGB(110,110,120);
 static const COLORREF C_LINE   = RGB(58,58,66);
 static const COLORREF C_GREEN  = RGB(87,206,117);
 static const COLORREF C_AMBER  = RGB(230,160,60);
+static const COLORREF C_RED    = RGB(220,80,80);
 
 static HFONT  s_fontTitle, s_fontLabel, s_fontSmall;
 static HBRUSH s_brPanel, s_brList, s_brDisplay;
 
-enum { ID_SLIDER=101, ID_LISTBOX=102, ID_PLAY=103,
+enum { ID_SLIDER=101, ID_LISTBOX=102, ID_PLAY=103, ID_STOP=107,
        ID_PC_AUDIO=104, ID_MIC=105, ID_MIC_COMBO=106,
        WM_DEVLIST = WM_USER+1 };
 
@@ -76,8 +77,8 @@ bool SendCmd(char cmd, const char* data=nullptr, int len=0) {
 }
 
 bool SendVolume(int vol) { return SendCmd('V',(char*)&vol,sizeof(vol)); }
-
 bool SendPcAudio(bool on) { char d=on?1:0; return SendCmd('A',&d,1); }
+bool SendStop() { return SendCmd('S'); }
 
 bool SendMic(bool on, int devIdx) {
     std::lock_guard<std::mutex> lk(g_SockLock);
@@ -222,7 +223,8 @@ void DevListReceiverThread() {
         std::vector<std::string> devs;
         for(int i=0;i<count&&i<32;i++){
             int nl;
-            if(!RecvAll(cli,(char*)&nl,4)||nl<=0||nl>512) break;
+            if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>512) break;
+            if(nl==0) continue;  // skip empty names instead of breaking
             std::vector<char> nm(nl+1); if(!RecvAll(cli,nm.data(),nl)) break;
             nm[nl]=0; devs.push_back(std::string(nm.data()));
         }
@@ -283,17 +285,25 @@ void BuildControls(HWND hwnd){
     if(!g_Sounds.empty()) SendMessageA(g_hListBox,LB_SETCURSEL,0,0);
     y+=148;
 
-    g_hPlayBtn=CreateWindowExW(0,L"BUTTON",L"\u25B6  Play Sound",
-        WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,w,30,hwnd,(HMENU)ID_PLAY,GetModuleHandle(0),0);
+    // play + stop row
+    int halfW = (w - 6) / 2;
+    g_hPlayBtn=CreateWindowExW(0,L"BUTTON",L"\u25B6  Play",
+        WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,halfW,30,hwnd,(HMENU)ID_PLAY,GetModuleHandle(0),0);
     SendMessage(g_hPlayBtn,WM_SETFONT,(WPARAM)s_fontLabel,0);
     SetWindowTheme(g_hPlayBtn,L"",L"");
+
+    g_hStopBtn=CreateWindowExW(0,L"BUTTON",L"\u25A0  Stop",
+        WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+halfW+6,y,halfW,30,hwnd,(HMENU)ID_STOP,GetModuleHandle(0),0);
+    SendMessage(g_hStopBtn,WM_SETFONT,(WPARAM)s_fontLabel,0);
+    SetWindowTheme(g_hStopBtn,L"",L"");
+
     if(g_Sounds.empty()) EnableWindow(g_hPlayBtn,FALSE);
     y+=40;
 
     // pc audio
     HWND hLA=CreateWindowExW(0,L"STATIC",L"PC AUDIO",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y+3,80,16,hwnd,0,GetModuleHandle(0),0);
     SendMessage(hLA,WM_SETFONT,(WPARAM)s_fontLabel,0);
-        g_hPcAudioChk=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+    g_hPcAudioChk=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
         x+w-20,y+2,20,20,hwnd,(HMENU)ID_PC_AUDIO,GetModuleHandle(0),0);
     SetWindowTheme(g_hPcAudioChk,L"",L"");
     y+=28;
@@ -359,6 +369,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp){
     case WM_COMMAND:{
         int id=LOWORD(wp);
         if(id==ID_PLAY){ PlaySelected(); }
+        else if(id==ID_STOP){ SendStop(); }
         else if(id==ID_LISTBOX && HIWORD(wp)==LBN_DBLCLK){ PlaySelected(); }
         else if(id==ID_PC_AUDIO){
             bool on=(SendMessage(g_hPcAudioChk,BM_GETCHECK,0,0)==BST_CHECKED);
