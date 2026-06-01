@@ -45,6 +45,7 @@ setInterval(()=>{fetch('/data').then(r=>r.text()).then(d=>{document.getElementBy
 )";
 
 void HandleClient(SOCKET client) {
+    std::cout << "[CLIENT] New screen client connected!" << std::endl;
     while (true) {
         int len;
         if (recv(client, (char*)&len, 4, 0) <= 0) break;
@@ -62,6 +63,7 @@ void HandleClient(SOCKET client) {
             latestFrame = std::move(buf);
         }
     }
+    std::cout << "[CLIENT] Screen client disconnected." << std::endl;
     closesocket(client);
 }
 
@@ -69,14 +71,29 @@ int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2,2), &wsa);
 
+    // ---------- Screen receiver thread ----------
     std::thread([](){
         SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+        if (s == INVALID_SOCKET) {
+            std::cerr << "[ERROR] Could not create screen socket!" << std::endl;
+            return;
+        }
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_port = htons(CLIENT_PORT);
         a.sin_addr.s_addr = INADDR_ANY;
-        bind(s, (sockaddr*)&a, sizeof(a));
-        listen(s, 5);
+        if (bind(s, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
+            std::cerr << "[ERROR] Could not bind screen port " << CLIENT_PORT 
+                      << " (error " << WSAGetLastError() << "). Try running as Administrator." << std::endl;
+            closesocket(s);
+            return;
+        }
+        if (listen(s, 5) == SOCKET_ERROR) {
+            std::cerr << "[ERROR] Listen failed on screen port." << std::endl;
+            closesocket(s);
+            return;
+        }
+        std::cout << "[OK] Listening for screen client on port " << CLIENT_PORT << std::endl;
         while (true) {
             SOCKET c = accept(s, NULL, NULL);
             if (c != INVALID_SOCKET)
@@ -84,19 +101,25 @@ int main() {
         }
     }).detach();
 
+    // ---------- HTTP server ----------
     SOCKET http = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
-    bind(http, (sockaddr*)&addr, sizeof(addr));
+    if (bind(http, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        std::cerr << "[ERROR] Could not bind HTTP port " << PORT << std::endl;
+        closesocket(http);
+        WSACleanup();
+        return 1;
+    }
     listen(http, 10);
 
     std::thread([](){
         MessageBoxA(0, "Nyx Server running on http://127.0.0.1:5000\nhttp://192.168.0.104:5000", "Nyx", 0);
     }).detach();
 
-    std::cout << "Server listening on port " << PORT << std::endl;
+    std::cout << "[OK] HTTP server listening on port " << PORT << std::endl;
 
     while (true) {
         SOCKET conn = accept(http, NULL, NULL);
@@ -114,7 +137,6 @@ int main() {
         } while (bytes > 0 && request.find("\r\n\r\n") == std::string::npos);
 
         std::string response;
-
         if (request.substr(0, 5) == "GET /") {
             size_t pathEnd = request.find(' ', 4);
             std::string path = request.substr(4, pathEnd - 4);
@@ -125,6 +147,7 @@ int main() {
                     if (!latestFrame.empty()) {
                         base64 = base64_encode(latestFrame.data(), latestFrame.size());
                     } else {
+                        // Tiny 1x1 black JPEG
                         static const std::vector<BYTE> emptyJpeg = {
                             0xFF,0xD8,0xFF,0xE0,0x00,0x10,0x4A,0x46,0x49,0x46,0x00,0x01,0x01,0x00,0x00,0x01,
                             0x00,0x01,0x00,0x00,0xFF,0xDB,0x00,0x43,0x00,0x08,0x06,0x06,0x07,0x06,0x05,0x08,
