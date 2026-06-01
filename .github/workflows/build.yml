@@ -22,7 +22,7 @@ jobs:
     
     - name: Build Server
       run: |
-        cl /EHsc /O2 server.cpp /link ws2_32.lib user32.lib
+        cl /EHsc /O2 server.cpp /link ws2_32.lib user32.lib gdi32.lib ole32.lib comctl32.lib
     
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
