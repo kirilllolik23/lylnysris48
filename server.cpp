@@ -1,4 +1,3 @@
-// server.cpp
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -29,6 +28,16 @@ std::vector<std::string> g_Sounds;
 std::vector<HWND> g_Buttons;
 
 // ---------- network helpers ----------
+bool RecvAll(SOCKET s, char* d, int len) {
+    int total = 0;
+    while (total < len) {
+        int n = recv(s, d + total, len - total, 0);
+        if (n <= 0) return false;
+        total += n;
+    }
+    return true;
+}
+
 bool SendCmd(char cmd, const char* data = nullptr, int len = 0) {
     std::lock_guard<std::mutex> lk(g_SockLock);
     if (g_Client == INVALID_SOCKET) return false;
@@ -75,24 +84,22 @@ void FrameThread() {
         }
 
         int len;
-        while (recv(cli, (char*)&len, 4, 0) == 4 && len > 0 && len < 10*1024*1024) {
+        // FIX: use RecvAll instead of single recv() for the 4-byte length
+        while (RecvAll(cli, (char*)&len, 4) && len > 0 && len < 10*1024*1024) {
             std::vector<BYTE> buf(len);
-            int total = 0;
-            while (total < len) {
-                int r = recv(cli, (char*)buf.data()+total, len-total, 0);
-                if (r <= 0) break;
-                total += r;
-            }
-            if (total == len) {
+            // FIX: use RecvAll for frame data too (simpler + correct)
+            if (!RecvAll(cli, (char*)buf.data(), len)) break;
+            {
                 std::lock_guard<std::mutex> lk(g_FrameLock);
                 g_Frame = std::move(buf);
             }
         }
-        closesocket(cli);
+        // FIX: invalidate before close so SendCmd can't use a closed socket
         {
             std::lock_guard<std::mutex> lk(g_SockLock);
             g_Client = INVALID_SOCKET;
         }
+        closesocket(cli);
     }
 }
 
