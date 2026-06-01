@@ -54,8 +54,6 @@ void SendScreen(SOCKET sock) {
         SelectObject(hdcMem, hBitmap);
         BitBlt(hdcMem, 0, 0, rect.right, rect.bottom, hdc, 0, 0, SRCCOPY);
 
-        // Save as JPEG and send (simplified - full impl is long)
-        // For brevity: send raw bitmap data
         BITMAPINFO bmi = {0};
         bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
         bmi.bmiHeader.biWidth = rect.right;
@@ -64,20 +62,35 @@ void SendScreen(SOCKET sock) {
         bmi.bmiHeader.biBitCount = 24;
         bmi.bmiHeader.biCompression = BI_RGB;
 
-        int size = rect.right * rect.bottom * 3;
+        // Fix: Calculate proper DWORD-aligned stride
+        int stride = ((rect.right * 24 + 31) / 32) * 4;
+        int size = stride * rect.bottom;
         BYTE* buffer = new BYTE[size];
         GetDIBits(hdcMem, hBitmap, 0, rect.bottom, buffer, &bmi, DIB_RGB_COLORS);
 
-        int len = size;
-        send(sock, (char*)&len, 4, 0);
-        send(sock, (char*)buffer, size, 0);
+        // Send size then data
+        send(sock, (char*)&size, 4, 0);
+        
+        // Fix: Send in chunks to handle large data properly
+        int sent = 0;
+        while (sent < size) {
+            int result = send(sock, (char*)buffer + sent, size - sent, 0);
+            if (result <= 0) {
+                delete[] buffer;
+                DeleteObject(hBitmap);
+                DeleteDC(hdcMem);
+                ReleaseDC(hwnd, hdc);
+                return;
+            }
+            sent += result;
+        }
 
         delete[] buffer;
         DeleteObject(hBitmap);
         DeleteDC(hdcMem);
         ReleaseDC(hwnd, hdc);
 
-        Sleep(180); // ~5-6 fps
+        Sleep(180);
     }
 }
 

@@ -1,4 +1,4 @@
-name: Build Nyx RAT
+name: Build
 
 on:
   push:
@@ -11,15 +11,18 @@ jobs:
     steps:
     - uses: actions/checkout@v4
     
-    - name: Build Client (Virus)
+    - name: Setup MSVC Compiler
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: amd64
+    
+    - name: Build Client
       run: |
-        cl /EHsc /O2 client.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib winmm.lib
-        move client.exe client.exe
+        cl /EHsc /O2 client.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib winmm.lib ws2_32.lib
     
     - name: Build Server
       run: |
         cl /EHsc /O2 server.cpp /link ws2_32.lib user32.lib
-        move server.exe server.exe
     
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
