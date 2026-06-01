@@ -181,7 +181,7 @@ void BuildControls(HWND hwnd) {
 
     // slider
     g_hSlider = CreateWindowExW(0, TRACKBAR_CLASSW, L"",
-                WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTO_TICKS,
+                WS_CHILD | WS_VISIBLE | TBS_HORZ | TBS_AUTOTICKS,
                 x, 74, w, 30, hwnd, (HMENU)ID_SLIDER, GetModuleHandle(0), 0);
     SendMessage(g_hSlider, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
     SendMessage(g_hSlider, TBM_SETPOS,   TRUE, 50);
@@ -247,12 +247,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         RECT display = { PANEL_W, 0, rc.right, rc.bottom };
         FillRect(hdc, &panel,   s_brPanel);
         FillRect(hdc, &display, s_brDisplay);
-        // divider
         HPEN pen = CreatePen(PS_SOLID, 1, C_LINE);
         HPEN old = (HPEN)SelectObject(hdc, pen);
         MoveToEx(hdc, PANEL_W, 0, NULL);
         LineTo(hdc, PANEL_W, rc.bottom);
-        // separators
         MoveToEx(hdc, 18, 46, NULL);  LineTo(hdc, PANEL_W - 18, 46);
         MoveToEx(hdc, 18, 106, NULL); LineTo(hdc, PANEL_W - 18, 106);
         SelectObject(hdc, old);
@@ -338,7 +336,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     int dw = (int)(bw * scale), dh = (int)(bh * scale);
                     int dx = ax + (aw - dw) / 2, dy = ay + (ah - dh) / 2;
 
-                    // dark border around image
                     Gdiplus::Graphics g(hdc);
                     Gdiplus::SolidBrush br(Gdiplus::Color(20, 20, 24));
                     g.FillRectangle(&br, dx - 2, dy - 2, dw + 4, dh + 4);
@@ -383,7 +380,6 @@ void FindMP3s() {
 }
 
 int main() {
-    // ═══════ THIS WAS MISSING — every Winsock call was failing ═══════
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
 
