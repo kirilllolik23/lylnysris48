@@ -6,9 +6,8 @@
 #include <vector>
 #include <thread>
 #pragma comment(lib, "ws2_32.lib")
-// ... rest stays exactly the same
 
-const int PORT = 5000;  // HTTP port
+const int PORT = 5000;
 const int CLIENT_PORT = 4444;
 
 std::string html = R"(
@@ -25,31 +24,33 @@ setInterval(()=>{fetch('/data').then(r=>r.text()).then(d=>{document.getElementBy
 )";
 
 void HandleClient(SOCKET client) {
-    // Receive screen and serve via HTTP
     while (true) {
         int len;
-        recv(client, (char*)&len, 4, 0);
+        int recvResult = recv(client, (char*)&len, 4, 0);
+        if (recvResult <= 0) break;
         std::vector<char> buf(len);
-        recv(client, buf.data(), len, 0);
-        
-        // Save or serve base64
-        // Simple: write to file or memory
+        int total = 0;
+        while (total < len) {
+            int got = recv(client, buf.data() + total, len - total, 0);
+            if (got <= 0) break;
+            total += got;
+        }
+        // For now, just ignore the received screen data
     }
+    closesocket(client);
 }
 
 int main() {
     WSADATA wsa;
     WSAStartup(MAKEWORD(2,2), &wsa);
     
-    // HTTP Server
-    SOCKET http = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in addr{ AF_INET, htons(PORT), INADDR_ANY };
-    bind(http, (sockaddr*)&addr, sizeof(addr));
-    listen(http, 10);
-    
+    // Start a separate thread for the client screen‑capture listener
     std::thread([](){
         SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-        sockaddr_in a{ AF_INET, htons(CLIENT_PORT), INADDR_ANY };
+        sockaddr_in a{};
+        a.sin_family = AF_INET;
+        a.sin_port = htons(CLIENT_PORT);
+        a.sin_addr.s_addr = INADDR_ANY;
         bind(s, (sockaddr*)&a, sizeof(a));
         listen(s, 5);
         while (true) {
@@ -58,11 +59,31 @@ int main() {
         }
     }).detach();
     
-    MessageBoxA(0, "Nyx Server running on port 5000\nOpen http://127.0.0.1:5000", "Nyx", 0);
+    // HTTP server
+    SOCKET http = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(PORT);
+    addr.sin_addr.s_addr = INADDR_ANY;
+    bind(http, (sockaddr*)&addr, sizeof(addr));
+    listen(http, 10);
+    
+    // Removed blocking MessageBox – server now starts immediately
+    // (If you want a notification, print to console or use a non‑blocking thread)
+    printf("Nyx Server running on http://127.0.0.1:%d\n", PORT);
     
     while (true) {
         SOCKET conn = accept(http, NULL, NULL);
-        send(conn, ("HTTP/1.1 200 OK\r\nContent-Length: " + std::to_string(html.size()) + "\r\n\r\n" + html).c_str(), html.size() + 100, 0);
+        
+        // Build the full HTTP response
+        std::string response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/html\r\n"
+            "Content-Length: " + std::to_string(html.size()) + "\r\n"
+            "Connection: close\r\n"
+            "\r\n" + html;
+        
+        send(conn, response.c_str(), response.size(), 0);
         closesocket(conn);
     }
     
