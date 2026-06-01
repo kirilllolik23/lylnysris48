@@ -1,4 +1,3 @@
-// server.cpp
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -10,7 +9,6 @@
 
 const int PORT = 5000;
 const int CLIENT_PORT = 4444;
-const std::string BIND_IP = "192.168.0.104";  // your private IP
 
 std::string html = R"(
 <!DOCTYPE html>
@@ -37,30 +35,22 @@ void HandleClient(SOCKET client) {
             if (got <= 0) break;
             total += got;
         }
-        // (future: handle the screen buffer)
     }
     closesocket(client);
 }
 
 int main() {
     WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        MessageBoxA(0, "WSAStartup failed", "Error", 0);
-        return 1;
-    }
+    WSAStartup(MAKEWORD(2,2), &wsa);
 
-    // ---------- Client listener thread ----------
+    // Client screen‑capture listener
     std::thread([](){
         SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
-        if (s == INVALID_SOCKET) return;
         sockaddr_in a{};
         a.sin_family = AF_INET;
         a.sin_port = htons(CLIENT_PORT);
         a.sin_addr.s_addr = INADDR_ANY;
-        if (bind(s, (sockaddr*)&a, sizeof(a)) == SOCKET_ERROR) {
-            closesocket(s);
-            return;
-        }
+        bind(s, (sockaddr*)&a, sizeof(a));
         listen(s, 5);
         while (true) {
             SOCKET c = accept(s, NULL, NULL);
@@ -69,56 +59,37 @@ int main() {
         }
     }).detach();
 
-    // ---------- HTTP server ----------
+    // HTTP server
     SOCKET http = socket(AF_INET, SOCK_STREAM, 0);
-    if (http == INVALID_SOCKET) {
-        MessageBoxA(0, "Socket creation failed", "Error", 0);
-        WSACleanup();
-        return 1;
-    }
-
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(PORT);
-    // Convert the IP string to binary
-    if (inet_pton(AF_INET, BIND_IP.c_str(), &addr.sin_addr) != 1) {
-        MessageBoxA(0, "Invalid IP address", "Error", 0);
-        closesocket(http);
-        WSACleanup();
-        return 1;
-    }
+    addr.sin_addr.s_addr = INADDR_ANY;          // listen on all interfaces
+    bind(http, (sockaddr*)&addr, sizeof(addr));
+    listen(http, 10);
 
-    if (bind(http, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        MessageBoxA(0, "Bind failed. Try running as Administrator.", "Error", 0);
-        closesocket(http);
-        WSACleanup();
-        return 1;
-    }
-    if (listen(http, 10) == SOCKET_ERROR) {
-        MessageBoxA(0, "Listen failed", "Error", 0);
-        closesocket(http);
-        WSACleanup();
-        return 1;
-    }
-
-    // Show a message box WITHOUT blocking the server
     std::thread([](){
-        MessageBoxA(0,
-            "Nyx Server running on http://192.168.0.104:5000\n"
-            "Make sure your firewall allows port 5000!",
-            "Nyx", 0);
+        MessageBoxA(0, "Nyx Server running on http://127.0.0.1:5000\nhttp://192.168.0.104:5000", "Nyx", 0);
     }).detach();
 
-    std::cout << "Server listening on " << BIND_IP << ":" << PORT << std::endl;
+    std::cout << "Server listening on port " << PORT << std::endl;
 
     while (true) {
         SOCKET conn = accept(http, NULL, NULL);
-        if (conn == INVALID_SOCKET) {
-            std::cerr << "Accept failed: " << WSAGetLastError() << std::endl;
-            continue;
-        }
+        if (conn == INVALID_SOCKET) continue;
 
-        // Build the response correctly
+        // Read the browser's request
+        char buf[4096];
+        std::string request;
+        int bytes;
+        do {
+            bytes = recv(conn, buf, sizeof(buf) - 1, 0);
+            if (bytes > 0) {
+                buf[bytes] = '\0';
+                request += buf;
+            }
+        } while (bytes > 0 && request.find("\r\n\r\n") == std::string::npos);
+
         std::string response =
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: text/html\r\n"
