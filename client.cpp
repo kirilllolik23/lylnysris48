@@ -99,6 +99,9 @@ void CommandListener(SOCKET s) {
             std::vector<char> buf(sz);
             if (!RecvAll(s, buf.data(), sz)) break;
 
+            // FIX: close MCI first so it releases the file lock
+            mciSendStringA("close nyx", 0, 0, 0);
+
             char tmp[MAX_PATH];
             GetTempPathA(MAX_PATH, tmp);
             std::string f = std::string(tmp) + "nyx_remote.mp3";
@@ -106,7 +109,6 @@ void CommandListener(SOCKET s) {
             out.write(buf.data(), sz);
             out.close();
 
-            mciSendStringA("close nyx", 0, 0, 0);
             mciSendStringA(("open \"" + f + "\" type mpegvideo alias nyx").c_str(), 0, 0, 0);
             mciSendStringA("play nyx", 0, 0, 0);
         }
