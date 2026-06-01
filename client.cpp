@@ -1,7 +1,8 @@
 // client.cpp
-#include <windows.h>
+#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <gdiplus.h>
 #include <string>
 #include <thread>
