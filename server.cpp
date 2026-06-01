@@ -1,5 +1,4 @@
 // server.cpp
-#define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -20,13 +19,11 @@
 
 const int PORT = 4444;
 
-// shared data
 std::vector<BYTE> g_Frame;
 std::mutex g_FrameLock;
 SOCKET g_Client = INVALID_SOCKET;
 std::mutex g_SockLock;
 
-// UI handles
 HWND g_hWnd, g_hSlider;
 std::vector<std::string> g_Sounds;
 std::vector<HWND> g_Buttons;
@@ -103,12 +100,11 @@ void FrameThread() {
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch(msg) {
     case WM_CREATE: {
-        // volume slider
         g_hSlider = CreateWindowExA(0, TRACKBAR_CLASSA, "", WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_NOTICKS,
                                     10, 10, 200, 30, hwnd, (HMENU)101, GetModuleHandle(0), 0);
         SendMessage(g_hSlider, TBM_SETRANGE, TRUE, MAKELONG(0, 100));
         SendMessage(g_hSlider, TBM_SETPOS, TRUE, 50);
-        // buttons for each MP3
+
         int y = 50;
         for (size_t i = 0; i < g_Sounds.size(); ++i, y += 30) {
             HWND btn = CreateWindowExA(0, "BUTTON", g_Sounds[i].c_str(),
@@ -116,7 +112,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         hwnd, (HMENU)(200 + i), GetModuleHandle(0), 0);
             g_Buttons.push_back(btn);
         }
-        SetTimer(hwnd, 1, 200, NULL); // refresh ~5fps
+        SetTimer(hwnd, 1, 200, NULL);
         return 0;
     }
     case WM_HSCROLL:
@@ -183,7 +179,6 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
-// ---------- scan folder for MP3s ----------
 void FindMP3s() {
     WIN32_FIND_DATAA fd;
     HANDLE h = FindFirstFileA("*.mp3", &fd);
@@ -195,22 +190,17 @@ void FindMP3s() {
 }
 
 int main() {
-    // GDI+
     Gdiplus::GdiplusStartupInput gdip;
     ULONG_PTR gdipToken;
     Gdiplus::GdiplusStartup(&gdipToken, &gdip, 0);
 
-    // common controls
     INITCOMMONCONTROLSEX icex = {sizeof(icex), ICC_BAR_CLASSES};
     InitCommonControlsEx(&icex);
 
-    // find MP3s
     FindMP3s();
 
-    // start network
     std::thread(FrameThread).detach();
 
-    // register class
     WNDCLASSEXA wc = {sizeof(wc)};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(0);
