@@ -293,7 +293,7 @@ void BuildControls(HWND hwnd){
     // pc audio
     HWND hLA=CreateWindowExW(0,L"STATIC",L"PC AUDIO",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y+3,80,16,hwnd,0,GetModuleHandle(0),0);
     SendMessage(hLA,WM_SETFONT,(WPARAM)s_fontLabel,0);
-    g_hPcAudioChk=CreateWindowExW(0,L"BUTTON,L"",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
+        g_hPcAudioChk=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,
         x+w-20,y+2,20,20,hwnd,(HMENU)ID_PC_AUDIO,GetModuleHandle(0),0);
     SetWindowTheme(g_hPcAudioChk,L"",L"");
     y+=28;
