@@ -406,7 +406,7 @@ void BuildControls(HWND hwnd){
     SendMessage(g_hBtnEdit3,WM_SETFONT,(WPARAM)s_fontSmall,0);
     EnableWindow(g_hBtnEdit3,FALSE); y+=28;
 
-    g_hSendPopup=CreateWindowExW(0,L"BUTTON",L"\uD83D\uDCAC  Send Popup",
+        g_hSendPopup=CreateWindowExW(0,L"BUTTON",L"\u2757  Send Popup",
         WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,w,30,hwnd,(HMENU)ID_SEND_POPUP,GetModuleHandle(0),0);
     SendMessage(g_hSendPopup,WM_SETFONT,(WPARAM)s_fontLabel,0); SetWindowTheme(g_hSendPopup,L"",L"");
     y+=36;
