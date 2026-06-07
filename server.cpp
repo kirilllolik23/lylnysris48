@@ -43,7 +43,6 @@ static HWND g_hProcList,g_hProcRefresh,g_hProcKill;
 static std::vector<std::string> g_Sounds,g_MicDevs; static std::vector<DWORD> g_ProcPIDs;
 static bool g_PcAudioOn=false,g_MicOn=false,g_FullCtrl=false;
 
-// display rect tracking for mouse mapping
 static int g_ImgW=0,g_ImgH=0,g_DispX=0,g_DispY=0,g_DispW=0,g_DispH=0;
 static bool g_MouseCaptured=false;
 static DWORD g_LastMoveTick=0;
@@ -61,7 +60,6 @@ enum { ID_SLIDER=101,ID_LISTBOX=102,ID_PLAY=103,ID_STOP=107,
        ID_SEND_POPUP=113,ID_PROC_LIST=114,ID_PROC_REFRESH=115,ID_PROC_KILL=116,ID_FULL_CTRL=117,
        WM_DEVLIST=WM_USER+1,WM_DIALOG_RESP=WM_USER+2,WM_PROCLIST=WM_USER+3 };
 
-// ── network ──
 bool RecvAll(SOCKET s,char*d,int len){int t=0;while(t<len){int n=recv(s,d+t,len-t,0);if(n<=0)return false;t+=n;}return true;}
 
 bool SendCmd(char cmd,const char*data=nullptr,int len=0){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;if(send(g_Client,&cmd,1,0)!=1)return false;if(len>0&&data&&send(g_Client,data,len,0)!=len)return false;return true;}
@@ -79,7 +77,6 @@ bool SendMouseClick(char btn,char act){std::lock_guard<std::mutex>lk(g_SockLock)
 bool SendKey(DWORD vk,char act){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;char b[6]={'k'};memcpy(b+1,&vk,4);b[5]=act;return send(g_Client,b,6,0)==6;}
 bool SendMouseWheel(int delta){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;char b[5]={'w'};memcpy(b+1,&delta,4);return send(g_Client,b,5,0)==5;}
 
-// ── mouse mapping ──
 bool MapMouse(LPARAM lp,int&nx,int&ny,bool clamp=false){
     int mx=MY_GET_X_LPARAM(lp),my=MY_GET_Y_LPARAM(lp);
     if(g_DispW<=0||g_DispH<=0)return false;
@@ -91,7 +88,6 @@ bool MapMouse(LPARAM lp,int&nx,int&ny,bool clamp=false){
 
 void RefreshStatus(){bool ok;{std::lock_guard<std::mutex>lk(g_SockLock);ok=(g_Client!=INVALID_SOCKET);}if(g_hStatus)SetWindowTextW(g_hStatus,ok?L"\u25CF  Connected":L"\u25CB  Waiting for client\u2026");if(ok){SendCmd('L');g_PcAudioOn=false;g_MicOn=false;if(g_hPcAudioChk)SendMessage(g_hPcAudioChk,BM_SETCHECK,BST_UNCHECKED,0);if(g_hMicChk)SendMessage(g_hMicChk,BM_SETCHECK,BST_UNCHECKED,0);}}
 
-// ── threads ──
 void FrameThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;{std::lock_guard<std::mutex>lk(g_SockLock);g_Client=cli;}RefreshStatus();int len;while(RecvAll(cli,(char*)&len,4)&&len>0&&len<10*1024*1024){std::vector<BYTE>buf(len);if(!RecvAll(cli,(char*)buf.data(),len))break;{std::lock_guard<std::mutex>lk(g_FrameLock);g_Frame=std::move(buf);}}{std::lock_guard<std::mutex>lk(g_SockLock);g_Client=INVALID_SOCKET;}closesocket(cli);RefreshStatus();}}
 
 void AudioReceiverThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_AUDIO);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int sr=48000;short ch=2;if(!RecvAll(cli,(char*)&sr,4)||!RecvAll(cli,(char*)&ch,2)){closesocket(cli);continue;}int inCh=ch;CoInitialize(0);WAVEFORMATEX wfx{};wfx.wFormatTag=WAVE_FORMAT_PCM;wfx.nChannels=ch;wfx.nSamplesPerSec=sr;wfx.wBitsPerSample=16;wfx.nBlockAlign=ch*2;wfx.nAvgBytesPerSec=sr*wfx.nBlockAlign;IMMDeviceEnumerator*pE=NULL;IMMDevice*pD=NULL;IAudioClient*pAC=NULL;IAudioRenderClient*pRC=NULL;HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);if(SUCCEEDED(hr))hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);if(SUCCEEDED(hr))hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);int outCh=ch;if(SUCCEEDED(hr))hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfx,NULL);if(FAILED(hr)&&pAC){WAVEFORMATEXTENSIBLE wfex{};wfex.Format.wFormatTag=WAVE_FORMAT_EXTENSIBLE;wfex.Format.nChannels=ch;wfex.Format.nSamplesPerSec=sr;wfex.Format.wBitsPerSample=16;wfex.Format.nBlockAlign=ch*2;wfex.Format.nAvgBytesPerSec=sr*ch*2;wfex.Format.cbSize=22;wfex.Samples.wValidBitsPerSample=16;wfex.dwChannelMask=(ch==1)?0x4:0x3;wfex.SubFormat=SUBTYPE_PCM;hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfex.Format,NULL);}if(FAILED(hr)&&pAC){WAVEFORMATEX*pM=NULL;if(SUCCEEDED(pAC->GetMixFormat(&pM))){outCh=pM->nChannels;pM->nSamplesPerSec=sr;pM->nAvgBytesPerSec=sr*pM->nBlockAlign;hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,pM,NULL);wfx.nChannels=outCh;wfx.nBlockAlign=outCh*2;wfx.nAvgBytesPerSec=sr*wfx.nBlockAlign;CoTaskMemFree(pM);}}if(SUCCEEDED(hr))hr=pAC->GetService(__uuidof(IAudioRenderClient),(void**)&pRC);if(SUCCEEDED(hr)){UINT32 bf;pAC->GetBufferSize(&bf);pAC->Start();while(true){int len;if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024)break;std::vector<char>data(len);if(!RecvAll(cli,data.data(),len))break;int inF=len/(inCh*2);std::vector<char>conv;char*pd=data.data();int pl=len;if(inCh!=outCh){int ol=inF*outCh*2;conv.resize(ol);short*iS=(short*)data.data();short*oS=(short*)conv.data();if(inCh==1&&outCh==2){for(int i=0;i<inF;i++){oS[i*2]=iS[i];oS[i*2+1]=iS[i];}}else if(inCh==2&&outCh==1){for(int i=0;i<inF;i++){oS[i]=(short)(((int)iS[i*2]+iS[i*2+1])/2);}}else{for(int i=0;i<inF*outCh&&i<inF*inCh;i++)oS[i]=iS[i];}pd=conv.data();pl=ol;}UINT32 fr=pl/wfx.nBlockAlign;for(int w=0;w<50;w++){UINT32 pad;pAC->GetCurrentPadding(&pad);if(bf-pad>=fr)break;Sleep(2);}UINT32 pad;pAC->GetCurrentPadding(&pad);UINT32 avail=bf-pad;if(fr>avail)fr=avail;if(!fr)continue;BYTE*pO;if(SUCCEEDED(pRC->GetBuffer(fr,&pO))){memcpy(pO,pd,fr*wfx.nBlockAlign);pRC->ReleaseBuffer(fr,0);}}pAC->Stop();}if(pRC)pRC->Release();if(pAC)pAC->Release();if(pD)pD->Release();if(pE)pE->Release();CoUninitialize();closesocket(cli);}}
@@ -102,7 +98,6 @@ void DialogResponseThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE
 
 void ProcListReceiverThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_PROCS);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,5);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int c;if(!RecvAll(cli,(char*)&c,4)){closesocket(cli);continue;}std::vector<std::string>names;std::vector<DWORD>pids;for(int i=0;i<c&&i<512;i++){DWORD pid;if(!RecvAll(cli,(char*)&pid,4))break;int nl;if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>256)break;std::string nm;if(nl>0){std::vector<char>buf(nl+1);if(!RecvAll(cli,buf.data(),nl))break;buf[nl]=0;nm=std::string(buf.data());}names.push_back(nm);pids.push_back(pid);}g_ProcPIDs=pids;char**arr=new char*[names.size()];for(size_t i=0;i<names.size();i++){arr[i]=new char[names[i].size()+1];strcpy(arr[i],names[i].c_str());}PostMessage(g_hWnd,WM_PROCLIST,(WPARAM)names.size(),(LPARAM)arr);closesocket(cli);}}
 
-// ── ui helpers ──
 void PlaySelected(){int sel=(int)SendMessageA(g_hListBox,LB_GETCURSEL,0,0);if(sel==LB_ERR||sel>=(int)g_Sounds.size())return;std::string f=g_Sounds[sel];if(f.find('\\')==std::string::npos){char d[MAX_PATH];GetCurrentDirectoryA(MAX_PATH,d);f=std::string(d)+"\\"+f;}SendPlay(f);}
 void SendPopup(){char mb[512]={};GetWindowTextA(g_hMsgEdit,mb,512);std::string msg(mb);int c=(int)SendMessageA(g_hBtnCombo,CB_GETCURSEL,0,0)+1;std::vector<std::string>btns;char b1[128]={},b2[128]={},b3[128]={};GetWindowTextA(g_hBtnEdit1,b1,128);btns.push_back(b1);if(c>=2){GetWindowTextA(g_hBtnEdit2,b2,128);btns.push_back(b2);}if(c>=3){GetWindowTextA(g_hBtnEdit3,b3,128);btns.push_back(b3);}SendDialog(msg,btns);}
 void KillSelected(){int sel=(int)SendMessageA(g_hProcList,LB_GETCURSEL,0,0);if(sel==LB_ERR||sel>=(int)g_ProcPIDs.size())return;SendKill(g_ProcPIDs[sel]);Sleep(500);SendCmd('R');}
@@ -126,7 +121,6 @@ void BuildControls(HWND hwnd){
     HWND hLM=CreateWindowExW(0,L"STATIC",L"MICROPHONE",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y+3,100,16,hwnd,0,0,0);SendMessage(hLM,WM_SETFONT,(WPARAM)s_fontLabel,0);g_hMicChk=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x+w-20,y+2,20,20,hwnd,(HMENU)ID_MIC,0,0);SetWindowTheme(g_hMicChk,L"",L"");y+=28;
     g_hMicCombo=CreateWindowExW(0,L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,x,y,w,200,hwnd,(HMENU)ID_MIC_COMBO,0,0);SendMessage(g_hMicCombo,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hMicCombo,L"",L"");y+=36;
 
-    // FULL CONTROL
     HWND hFC=CreateWindowExW(0,L"STATIC",L"FULL CONTROL",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y+3,110,16,hwnd,0,0,0);SendMessage(hFC,WM_SETFONT,(WPARAM)s_fontLabel,0);
     g_hFullCtrlChk=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,x+w-20,y+2,20,20,hwnd,(HMENU)ID_FULL_CTRL,0,0);SetWindowTheme(g_hFullCtrlChk,L"",L"");y+=28;
 
@@ -145,7 +139,6 @@ void BuildControls(HWND hwnd){
     g_hProcKill=CreateWindowExW(0,L"BUTTON",L"\u2716  Kill",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+tw*2+12,y,tw,28,hwnd,(HMENU)ID_PROC_KILL,0,0);SendMessage(g_hProcKill,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcKill,L"",L"");
 }
 
-// ── wndproc ──
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:BuildControls(hwnd);SetTimer(hwnd,1,80,NULL);return 0;
@@ -171,19 +164,17 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_PROCLIST:{int c=(int)wp;char**arr=(char**)lp;SendMessageA(g_hProcList,LB_RESETCONTENT,0,0);for(int i=0;i<c;i++){SendMessageA(g_hProcList,LB_ADDSTRING,0,(LPARAM)arr[i]);delete[]arr[i];}delete[]arr;return 0;}
     case WM_DEVLIST:SendMessageA(g_hMicCombo,CB_RESETCONTENT,0,0);for(auto&d:g_MicDevs)SendMessageA(g_hMicCombo,CB_ADDSTRING,0,(LPARAM)d.c_str());if(!g_MicDevs.empty())SendMessageA(g_hMicCombo,CB_SETCURSEL,0,0);EnableWindow(g_hMicChk,!g_MicDevs.empty());EnableWindow(g_hMicCombo,!g_MicDevs.empty());return 0;
 
-    // ── mouse input for full control ──
     case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
         if(g_FullCtrl){int nx,ny;if(MapMouse(lp,nx,ny)){SetCapture(hwnd);g_MouseCaptured=true;SetFocus(hwnd);SendMouseMove(nx,ny);char btn=(msg==WM_LBUTTONDOWN)?0:(msg==WM_RBUTTONDOWN)?1:2;SendMouseClick(btn,0);}}break;
     case WM_LBUTTONUP:case WM_RBUTTONUP:case WM_MBUTTONUP:
         if(g_FullCtrl){int nx,ny;MapMouse(lp,nx,ny,true);SendMouseMove(nx,ny);char btn=(msg==WM_LBUTTONUP)?0:(msg==WM_RBUTTONUP)?1:2;SendMouseClick(btn,1);if(g_MouseCaptured){ReleaseCapture();g_MouseCaptured=false;}}break;
     case WM_MOUSEMOVE:
-        if(g_FullCtrl&&(g_MouseCaptured||MapMouse(lp,*(int*)0,*(int*)0))){DWORD now=GetTickCount();if(now-g_LastMoveTick<16)break;g_LastMoveTick=now;int nx,ny;if(MapMouse(lp,nx,ny,g_MouseCaptured))SendMouseMove(nx,ny);}break;
+        if(g_FullCtrl){int tx,ty;bool over=MapMouse(lp,tx,ty);if(g_MouseCaptured||over){DWORD now=GetTickCount();if(now-g_LastMoveTick<16)break;g_LastMoveTick=now;int nx,ny;if(MapMouse(lp,nx,ny,g_MouseCaptured))SendMouseMove(nx,ny);}}break;
     case WM_MOUSEWHEEL:
         if(g_FullCtrl){POINT pt={MY_GET_X_LPARAM(lp),MY_GET_Y_LPARAM(lp)};ScreenToClient(hwnd,&pt);LPARAM clp=MAKELPARAM(pt.x,pt.y);int nx,ny;if(MapMouse(clp,nx,ny)){int delta=(short)HIWORD(wp);SendMouseMove(nx,ny);SendMouseWheel(delta);}}break;
 
-    // ── keyboard input for full control ──
     case WM_KEYDOWN:case WM_SYSKEYDOWN:
-        if(g_FullCtrl&&!(lp&0x40000000)){SendKey((DWORD)wp,0);}break; // bit 30 = was down, skip repeats
+        if(g_FullCtrl&&!(lp&0x40000000)){SendKey((DWORD)wp,0);}break;
     case WM_KEYUP:case WM_SYSKEYUP:
         if(g_FullCtrl){SendKey((DWORD)wp,1);}break;
 
