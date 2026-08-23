@@ -90,7 +90,83 @@ void RefreshStatus(){bool ok;{std::lock_guard<std::mutex>lk(g_SockLock);ok=(g_Cl
 
 void FrameThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;{std::lock_guard<std::mutex>lk(g_SockLock);g_Client=cli;}RefreshStatus();int len;while(RecvAll(cli,(char*)&len,4)&&len>0&&len<10*1024*1024){std::vector<BYTE>buf(len);if(!RecvAll(cli,(char*)buf.data(),len))break;{std::lock_guard<std::mutex>lk(g_FrameLock);g_Frame=std::move(buf);}}{std::lock_guard<std::mutex>lk(g_SockLock);g_Client=INVALID_SOCKET;}closesocket(cli);RefreshStatus();}}
 
-void AudioReceiverThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_AUDIO);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int sr=48000;short ch=2;if(!RecvAll(cli,(char*)&sr,4)||!RecvAll(cli,(char*)&ch,2)){closesocket(cli);continue;}int inCh=ch;CoInitialize(0);WAVEFORMATEX wfx{};wfx.wFormatTag=WAVE_FORMAT_PCM;wfx.nChannels=ch;wfx.nSamplesPerSec=sr;wfx.wBitsPerSample=16;wfx.nBlockAlign=ch*2;wfx.nAvgBytesPerSec=sr*wfx.nBlockAlign;IMMDeviceEnumerator*pE=NULL;IMMDevice*pD=NULL;IAudioClient*pAC=NULL;IAudioRenderClient*pRC=NULL;HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);if(SUCCEEDED(hr))hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);if(SUCCEEDED(hr))hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);int outCh=ch;if(SUCCEEDED(hr))hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfx,NULL);if(FAILED(hr)&&pAC){WAVEFORMATEXTENSIBLE wfex{};wfex.Format.wFormatTag=WAVE_FORMAT_EXTENSIBLE;wfex.Format.nChannels=ch;wfex.Format.nSamplesPerSec=sr;wfex.Format.wBitsPerSample=16;wfex.Format.nBlockAlign=ch*2;wfex.Format.nAvgBytesPerSec=sr*ch*2;wfex.Format.cbSize=22;wfex.Samples.wValidBitsPerSample=16;wfex.dwChannelMask=(ch==1)?0x4:0x3;wfex.SubFormat=SUBTYPE_PCM;hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfex.Format,NULL);}if(FAILED(hr)&&pAC){WAVEFORMATEX*pM=NULL;if(SUCCEEDED(pAC->GetMixFormat(&pM))){outCh=pM->nChannels;pM->nSamplesPerSec=sr;pM->nAvgBytesPerSec=sr*pM->nBlockAlign;hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,pM,NULL);wfx.nChannels=outCh;wfx.nBlockAlign=outCh*2;wfx.nAvgBytesPerSec=sr*wfx.nBlockAlign;CoTaskMemFree(pM);}}if(SUCCEEDED(hr))hr=pAC->GetService(__uuidof(IAudioRenderClient),(void**)&pRC);if(SUCCEEDED(hr)){UINT32 bf;pAC->GetBufferSize(&bf);pAC->Start();while(true){int len;if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024)break;std::vector<char>data(len);if(!RecvAll(cli,data.data(),len))break;int inF=len/(inCh*2);std::vector<char>conv;char*pd=data.data();int pl=len;if(inCh!=outCh){int ol=inF*outCh*2;conv.resize(ol);short*iS=(short*)data.data();short*oS=(short*)conv.data();if(inCh==1&&outCh==2){for(int i=0;i<inF;i++){oS[i*2]=iS[i];oS[i*2+1]=iS[i];}}else if(inCh==2&&outCh==1){for(int i=0;i<inF;i++){oS[i]=(short)(((int)iS[i*2]+iS[i*2+1])/2);}}else{for(int i=0;i<inF*outCh&&i<inF*inCh;i++)oS[i]=iS[i];}pd=conv.data();pl=ol;}UINT32 fr=pl/wfx.nBlockAlign;for(int w=0;w<50;w++){UINT32 pad;pAC->GetCurrentPadding(&pad);if(bf-pad>=fr)break;Sleep(2);}UINT32 pad;pAC->GetCurrentPadding(&pad);UINT32 avail=bf-pad;if(fr>avail)fr=avail;if(!fr)continue;BYTE*pO;if(SUCCEEDED(pRC->GetBuffer(fr,&pO))){memcpy(pO,pd,fr*wfx.nBlockAlign);pRC->ReleaseBuffer(fr,0);}}pAC->Stop();}if(pRC)pRC->Release();if(pAC)pAC->Release();if(pD)pD->Release();if(pE)pE->Release();CoUninitialize();closesocket(cli);}}
+void AudioReceiverThread(){
+    SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));
+    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_AUDIO);a.sin_addr.s_addr=INADDR_ANY;
+    bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);
+    while(true){
+        SOCKET cli=accept(srv,NULL,NULL);
+        if(cli==INVALID_SOCKET)continue;
+        int sr=48000;short inCh=2;
+        if(!RecvAll(cli,(char*)&sr,4)||!RecvAll(cli,(char*)&inCh,2)){closesocket(cli);continue;}
+        if(inCh<1)inCh=1;if(inCh>2)inCh=2;
+        CoInitialize(0);
+        IMMDeviceEnumerator*pE=NULL;IMMDevice*pD=NULL;IAudioClient*pAC=NULL;IAudioRenderClient*pRC=NULL;
+        HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);
+        if(SUCCEEDED(hr))hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);
+        if(SUCCEEDED(hr))hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
+        int outCh=2;bool renderFloat=false;int renderBps=2;
+        // Attempt 1: stereo 16-bit PCM at incoming sample rate
+        WAVEFORMATEX wfxPCM={};wfxPCM.wFormatTag=WAVE_FORMAT_PCM;wfxPCM.nChannels=2;wfxPCM.nSamplesPerSec=sr;
+        wfxPCM.wBitsPerSample=16;wfxPCM.nBlockAlign=4;wfxPCM.nAvgBytesPerSec=sr*4;
+        hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfxPCM,NULL);
+        // Attempt 2: use endpoint mix format (may be float), adjust sample rate
+        if(FAILED(hr)){
+            WAVEFORMATEX*pMF=NULL;
+            if(SUCCEEDED(pAC->GetMixFormat(&pMF))){
+                pMF->nSamplesPerSec=sr;pMF->nAvgBytesPerSec=sr*pMF->nBlockAlign;
+                HRESULT hr2=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,pMF,NULL);
+                if(SUCCEEDED(hr2)){
+                    outCh=pMF->nChannels;renderBps=pMF->wBitsPerSample/8;
+                    if(pMF->wFormatTag==WAVE_FORMAT_IEEE_FLOAT)renderFloat=true;
+                    else if(pMF->wFormatTag==WAVE_FORMAT_EXTENSIBLE){
+                        WAVEFORMATEXTENSIBLE*pEx=(WAVEFORMATEXTENSIBLE*)pMF;
+                        if(pEx->SubFormat.Data1==3)renderFloat=true;
+                    }
+                    hr=hr2;
+                }
+                CoTaskMemFree(pMF);
+            }
+        }
+        if(SUCCEEDED(hr))hr=pAC->GetService(__uuidof(IAudioRenderClient),(void**)&pRC);
+        if(SUCCEEDED(hr)){
+            UINT32 bf;pAC->GetBufferSize(&bf);pAC->Start();
+            while(true){
+                int len;if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024)break;
+                std::vector<char>data(len);if(!RecvAll(cli,data.data(),len))break;
+                int inF=len/(inCh*2);if(inF<=0)continue;
+                // Channel conversion: incoming (inCh) -> render endpoint (outCh)
+                std::vector<short>pcm(inF*outCh);short*iS=(short*)data.data();
+                if(inCh==outCh){memcpy(pcm.data(),iS,(size_t)inF*inCh*2);}
+                else if(inCh==1){for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=iS[i];}
+                else if(inCh==2&&outCh==1){for(int i=0;i<inF;i++)pcm[i]=(short)(((int)iS[i*2]+iS[i*2+1])/2);}
+                else{int mc=inCh<outCh?inCh:outCh;for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=(c<mc)?iS[i*inCh+c]:0;}
+                // Format conversion: 16-bit PCM intermediate -> render format
+                int frameBytes=outCh*renderBps;
+                std::vector<BYTE>renderBuf((size_t)inF*frameBytes);
+                if(renderFloat){
+                    float*fO=(float*)renderBuf.data();
+                    for(int i=0;i<inF*outCh;i++)fO[i]=pcm[i]/32768.0f;
+                }else if(renderBps==4){
+                    int32_t*s32=(int32_t*)renderBuf.data();
+                    for(int i=0;i<inF*outCh;i++)s32[i]=(int32_t)pcm[i]<<16;
+                }else if(renderBps==3){
+                    BYTE*p24=(BYTE*)renderBuf.data();
+                    for(int i=0;i<inF*outCh;i++){p24[i*3]=0;p24[i*3+1]=(BYTE)(pcm[i]&0xFF);p24[i*3+2]=(BYTE)((pcm[i]>>8)&0xFF);}
+                }else{
+                    memcpy(renderBuf.data(),pcm.data(),(size_t)inF*outCh*2);
+                }
+                UINT32 fr=inF;
+                for(int w=0;w<100;w++){UINT32 pad;pAC->GetCurrentPadding(&pad);if(bf-pad>=fr)break;Sleep(2);}
+                UINT32 pad;pAC->GetCurrentPadding(&pad);UINT32 avail=bf-pad;if(fr>avail)fr=avail;if(!fr)continue;
+                BYTE*pO;if(SUCCEEDED(pRC->GetBuffer(fr,&pO))){memcpy(pO,renderBuf.data(),(size_t)fr*frameBytes);pRC->ReleaseBuffer(fr,0);}
+            }
+            pAC->Stop();
+        }
+        if(pRC)pRC->Release();if(pAC)pAC->Release();if(pD)pD->Release();if(pE)pE->Release();
+        CoUninitialize();closesocket(cli);
+    }
+}
 
 void DevListReceiverThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_DEVS);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int c;if(!RecvAll(cli,(char*)&c,4)){closesocket(cli);continue;}std::vector<std::string>d;for(int i=0;i<c&&i<32;i++){int nl;if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>512)break;if(nl==0){d.push_back("(unknown)");continue;}std::vector<char>nm(nl+1);if(!RecvAll(cli,nm.data(),nl))break;nm[nl]=0;d.push_back(std::string(nm.data()));}g_MicDevs=d;PostMessage(g_hWnd,WM_DEVLIST,0,0);closesocket(cli);}}
 
