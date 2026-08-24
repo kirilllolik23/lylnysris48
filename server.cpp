@@ -305,9 +305,10 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                     if(g_ActiveClient!=newActive){
                         if(g_ActiveClient!=INVALID_SOCKET){
                             send(g_ActiveClient,"0",1,0);
-                            char aoff=0;send(g_ActiveClient,"A",&aoff,1);
-                            char moff=0;send(g_ActiveClient,"M",&moff,1);
-                            char foff=0;send(g_ActiveClient,"F",&foff,1);
+                            char off=0;
+                            send(g_ActiveClient,"A",1,0); send(g_ActiveClient,&off,1,0);
+                            send(g_ActiveClient,"M",1,0); send(g_ActiveClient,&off,1,0);
+                            send(g_ActiveClient,"F",1,0); send(g_ActiveClient,&off,1,0);
                         }
                         g_ActiveClient=newActive;
                         {std::lock_guard<std::mutex>slk(g_SockLock);g_Client=newActive;}
