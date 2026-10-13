@@ -20,8 +20,10 @@
 #pragma comment(lib, "uxtheme.lib")
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
-const int PORT=4444, PORT_AUDIO=4445, PORT_DEVS=4446, PORT_DIALOG=4447, PORT_PROCS=4448;
+const int PORT=4444;
 const int PANEL_W=264;
+
+enum ChannelType { CH_MAIN=0, CH_AUDIO=1, CH_DEVLIST=2, CH_DIALOG=3, CH_PROCLIST=4 };
 
 #ifndef WAVE_FORMAT_PCM
 #define WAVE_FORMAT_PCM 1
@@ -126,112 +128,161 @@ void ClientFrameReader(SOCKET cli){
     closesocket(cli);
 }
 
-void FrameThread(){
+// ---------- Channel handlers (replace the old per-port listener threads) ----------
+
+void HandleMainClient(SOCKET cli){
+    int hlen;
+    if(!RecvAll(cli,(char*)&hlen,4)||hlen<=0||hlen>255){closesocket(cli);return;}
+    char host[256]={0};
+    if(!RecvAll(cli,host,hlen)){closesocket(cli);return;}
+    {
+        std::lock_guard<std::mutex>lk(g_ClientListLock);
+        g_ClientList.push_back({cli, std::string(host)});
+        if(g_ActiveClient==INVALID_SOCKET){
+            g_ActiveClient=cli;
+            std::lock_guard<std::mutex>slk(g_SockLock);g_Client=cli;
+            send(cli, "1", 1, 0);
+        } else {
+            send(cli, "0", 1, 0);
+        }
+    }
+    PostMessage(g_hWnd, WM_CLIENTLIST, 0, 0);
+    ClientFrameReader(cli); // blocking; runs for life of this connection
+}
+
+void HandleAudioClient(SOCKET cli){
+    int sr=48000;short inCh=2;
+    if(!RecvAll(cli,(char*)&sr,4)||!RecvAll(cli,(char*)&inCh,2)){closesocket(cli);return;}
+    if(inCh<1)inCh=1;if(inCh>2)inCh=2;
+    CoInitialize(0);
+    IMMDeviceEnumerator*pE=NULL;IMMDevice*pD=NULL;IAudioClient*pAC=NULL;IAudioRenderClient*pRC=NULL;
+    HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);
+    if(SUCCEEDED(hr))hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);
+    if(SUCCEEDED(hr))hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
+    int outCh=2;bool renderFloat=false;int renderBps=2;
+    WAVEFORMATEX wfxPCM={};wfxPCM.wFormatTag=WAVE_FORMAT_PCM;wfxPCM.nChannels=2;wfxPCM.nSamplesPerSec=sr;
+    wfxPCM.wBitsPerSample=16;wfxPCM.nBlockAlign=4;wfxPCM.nAvgBytesPerSec=sr*4;
+    hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfxPCM,NULL);
+    if(FAILED(hr)){
+        WAVEFORMATEX*pMF=NULL;
+        if(SUCCEEDED(pAC->GetMixFormat(&pMF))){
+            pMF->nSamplesPerSec=sr;pMF->nAvgBytesPerSec=sr*pMF->nBlockAlign;
+            HRESULT hr2=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,pMF,NULL);
+            if(SUCCEEDED(hr2)){
+                outCh=pMF->nChannels;renderBps=pMF->wBitsPerSample/8;
+                if(pMF->wFormatTag==WAVE_FORMAT_IEEE_FLOAT)renderFloat=true;
+                else if(pMF->wFormatTag==WAVE_FORMAT_EXTENSIBLE){
+                    WAVEFORMATEXTENSIBLE*pEx=(WAVEFORMATEXTENSIBLE*)pMF;
+                    if(pEx->SubFormat.Data1==3)renderFloat=true;
+                }
+                hr=hr2;
+            }
+            CoTaskMemFree(pMF);
+        }
+    }
+    if(SUCCEEDED(hr))hr=pAC->GetService(__uuidof(IAudioRenderClient),(void**)&pRC);
+    if(SUCCEEDED(hr)){
+        UINT32 bf;pAC->GetBufferSize(&bf);pAC->Start();
+        while(true){
+            int len;if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024)break;
+            std::vector<char>data(len);if(!RecvAll(cli,data.data(),len))break;
+            int inF=len/(inCh*2);if(inF<=0)continue;
+            std::vector<short>pcm(inF*outCh);short*iS=(short*)data.data();
+            if(inCh==outCh){memcpy(pcm.data(),iS,(size_t)inF*inCh*2);}
+            else if(inCh==1){for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=iS[i];}
+            else if(inCh==2&&outCh==1){for(int i=0;i<inF;i++)pcm[i]=(short)(((int)iS[i*2]+iS[i*2+1])/2);}
+            else{int mc=inCh<outCh?inCh:outCh;for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=(c<mc)?iS[i*inCh+c]:0;}
+            int frameBytes=outCh*renderBps;
+            std::vector<BYTE>renderBuf((size_t)inF*frameBytes);
+            if(renderFloat){
+                float*fO=(float*)renderBuf.data();
+                for(int i=0;i<inF*outCh;i++)fO[i]=pcm[i]/32768.0f;
+            }else if(renderBps==4){
+                int32_t*s32=(int32_t*)renderBuf.data();
+                for(int i=0;i<inF*outCh;i++)s32[i]=(int32_t)pcm[i]<<16;
+            }else if(renderBps==3){
+                BYTE*p24=(BYTE*)renderBuf.data();
+                for(int i=0;i<inF*outCh;i++){p24[i*3]=0;p24[i*3+1]=(BYTE)(pcm[i]&0xFF);p24[i*3+2]=(BYTE)((pcm[i]>>8)&0xFF);}
+            }else{
+                memcpy(renderBuf.data(),pcm.data(),(size_t)inF*outCh*2);
+            }
+            UINT32 fr=inF;
+            for(int w=0;w<100;w++){UINT32 pad;pAC->GetCurrentPadding(&pad);if(bf-pad>=fr)break;Sleep(2);}
+            UINT32 pad;pAC->GetCurrentPadding(&pad);UINT32 avail=bf-pad;if(fr>avail)fr=avail;if(!fr)continue;
+            BYTE*pO;if(SUCCEEDED(pRC->GetBuffer(fr,&pO))){memcpy(pO,renderBuf.data(),(size_t)fr*frameBytes);pRC->ReleaseBuffer(fr,0);}
+        }
+        pAC->Stop();
+    }
+    if(pRC)pRC->Release();if(pAC)pAC->Release();if(pD)pD->Release();if(pE)pE->Release();
+    CoUninitialize();closesocket(cli);
+}
+
+void HandleDevListClient(SOCKET cli){
+    int c;
+    if(!RecvAll(cli,(char*)&c,4)){closesocket(cli);return;}
+    std::vector<std::string>d;
+    for(int i=0;i<c&&i<32;i++){
+        int nl;if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>512)break;
+        if(nl==0){d.push_back("(unknown)");continue;}
+        std::vector<char>nm(nl+1);if(!RecvAll(cli,nm.data(),nl))break;nm[nl]=0;
+        d.push_back(std::string(nm.data()));
+    }
+    g_MicDevs=d;
+    PostMessage(g_hWnd,WM_DEVLIST,0,0);
+    closesocket(cli);
+}
+
+void HandleDialogClient(SOCKET cli){
+    int len;
+    if(RecvAll(cli,(char*)&len,4)&&len>0&&len<1024){
+        std::vector<char>buf(len+1);RecvAll(cli,buf.data(),len);buf[len]=0;
+        std::string resp="user clicked "+std::string(buf.data());
+        char*hp=new char[resp.size()+1];strcpy(hp,resp.c_str());
+        PostMessageA(g_hWnd,WM_DIALOG_RESP,0,(LPARAM)hp);
+    }
+    closesocket(cli);
+}
+
+void HandleProcListClient(SOCKET cli){
+    int c;
+    if(!RecvAll(cli,(char*)&c,4)){closesocket(cli);return;}
+    std::vector<std::string>names;std::vector<DWORD>pids;
+    for(int i=0;i<c&&i<512;i++){
+        DWORD pid;if(!RecvAll(cli,(char*)&pid,4))break;
+        int nl;if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>256)break;
+        std::string nm;
+        if(nl>0){
+            std::vector<char>buf(nl+1);if(!RecvAll(cli,buf.data(),nl))break;buf[nl]=0;nm=std::string(buf.data());
+        }
+        names.push_back(nm);pids.push_back(pid);
+    }
+    g_ProcPIDs=pids;
+    char**arr=new char*[names.size()];
+    for(size_t i=0;i<names.size();i++){arr[i]=new char[names[i].size()+1];strcpy(arr[i],names[i].c_str());}
+    PostMessage(g_hWnd,WM_PROCLIST,(WPARAM)names.size(),(LPARAM)arr);
+    closesocket(cli);
+}
+
+// Single listener: accepts connections, reads a 1-byte channel ID, dispatches.
+void ListenerThread(){
     SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));
     sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT);a.sin_addr.s_addr=INADDR_ANY;
-    bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,5);
+    bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,32);
     while(true){
         SOCKET cli=accept(srv,NULL,NULL);
         if(cli==INVALID_SOCKET)continue;
-        int hlen;
-        if(!RecvAll(cli,(char*)&hlen,4)||hlen<=0||hlen>255){closesocket(cli);continue;}
-        char host[256]={0};
-        if(!RecvAll(cli,host,hlen)){closesocket(cli);continue;}
-        {
-            std::lock_guard<std::mutex>lk(g_ClientListLock);
-            g_ClientList.push_back({cli, std::string(host)});
-            if(g_ActiveClient==INVALID_SOCKET){
-                g_ActiveClient=cli;
-                std::lock_guard<std::mutex>slk(g_SockLock);g_Client=cli;
-                send(cli, "1", 1, 0);
-            } else {
-                send(cli, "0", 1, 0);
-            }
+        unsigned char ch;
+        if(!RecvAll(cli,(char*)&ch,1)){closesocket(cli);continue;}
+        switch(ch){
+            case CH_MAIN:     std::thread(HandleMainClient,cli).detach(); break;
+            case CH_AUDIO:    std::thread(HandleAudioClient,cli).detach(); break;
+            case CH_DEVLIST:  std::thread(HandleDevListClient,cli).detach(); break;
+            case CH_DIALOG:   std::thread(HandleDialogClient,cli).detach(); break;
+            case CH_PROCLIST: std::thread(HandleProcListClient,cli).detach(); break;
+            default: closesocket(cli); break;
         }
-        PostMessage(g_hWnd, WM_CLIENTLIST, 0, 0);
-        std::thread(ClientFrameReader, cli).detach();
     }
 }
-
-void AudioReceiverThread(){
-    SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));
-    sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_AUDIO);a.sin_addr.s_addr=INADDR_ANY;
-    bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);
-    while(true){
-        SOCKET cli=accept(srv,NULL,NULL);
-        if(cli==INVALID_SOCKET)continue;
-        int sr=48000;short inCh=2;
-        if(!RecvAll(cli,(char*)&sr,4)||!RecvAll(cli,(char*)&inCh,2)){closesocket(cli);continue;}
-        if(inCh<1)inCh=1;if(inCh>2)inCh=2;
-        CoInitialize(0);
-        IMMDeviceEnumerator*pE=NULL;IMMDevice*pD=NULL;IAudioClient*pAC=NULL;IAudioRenderClient*pRC=NULL;
-        HRESULT hr=CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);
-        if(SUCCEEDED(hr))hr=pE->GetDefaultAudioEndpoint(eRender,eConsole,&pD);
-        if(SUCCEEDED(hr))hr=pD->Activate(__uuidof(IAudioClient),CLSCTX_ALL,0,(void**)&pAC);
-        int outCh=2;bool renderFloat=false;int renderBps=2;
-        WAVEFORMATEX wfxPCM={};wfxPCM.wFormatTag=WAVE_FORMAT_PCM;wfxPCM.nChannels=2;wfxPCM.nSamplesPerSec=sr;
-        wfxPCM.wBitsPerSample=16;wfxPCM.nBlockAlign=4;wfxPCM.nAvgBytesPerSec=sr*4;
-        hr=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,&wfxPCM,NULL);
-        if(FAILED(hr)){
-            WAVEFORMATEX*pMF=NULL;
-            if(SUCCEEDED(pAC->GetMixFormat(&pMF))){
-                pMF->nSamplesPerSec=sr;pMF->nAvgBytesPerSec=sr*pMF->nBlockAlign;
-                HRESULT hr2=pAC->Initialize(AUDCLNT_SHAREMODE_SHARED,0,10000000,0,pMF,NULL);
-                if(SUCCEEDED(hr2)){
-                    outCh=pMF->nChannels;renderBps=pMF->wBitsPerSample/8;
-                    if(pMF->wFormatTag==WAVE_FORMAT_IEEE_FLOAT)renderFloat=true;
-                    else if(pMF->wFormatTag==WAVE_FORMAT_EXTENSIBLE){
-                        WAVEFORMATEXTENSIBLE*pEx=(WAVEFORMATEXTENSIBLE*)pMF;
-                        if(pEx->SubFormat.Data1==3)renderFloat=true;
-                    }
-                    hr=hr2;
-                }
-                CoTaskMemFree(pMF);
-            }
-        }
-        if(SUCCEEDED(hr))hr=pAC->GetService(__uuidof(IAudioRenderClient),(void**)&pRC);
-        if(SUCCEEDED(hr)){
-            UINT32 bf;pAC->GetBufferSize(&bf);pAC->Start();
-            while(true){
-                int len;if(!RecvAll(cli,(char*)&len,4)||len<=0||len>1024*1024)break;
-                std::vector<char>data(len);if(!RecvAll(cli,data.data(),len))break;
-                int inF=len/(inCh*2);if(inF<=0)continue;
-                std::vector<short>pcm(inF*outCh);short*iS=(short*)data.data();
-                if(inCh==outCh){memcpy(pcm.data(),iS,(size_t)inF*inCh*2);}
-                else if(inCh==1){for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=iS[i];}
-                else if(inCh==2&&outCh==1){for(int i=0;i<inF;i++)pcm[i]=(short)(((int)iS[i*2]+iS[i*2+1])/2);}
-                else{int mc=inCh<outCh?inCh:outCh;for(int i=0;i<inF;i++)for(int c=0;c<outCh;c++)pcm[i*outCh+c]=(c<mc)?iS[i*inCh+c]:0;}
-                int frameBytes=outCh*renderBps;
-                std::vector<BYTE>renderBuf((size_t)inF*frameBytes);
-                if(renderFloat){
-                    float*fO=(float*)renderBuf.data();
-                    for(int i=0;i<inF*outCh;i++)fO[i]=pcm[i]/32768.0f;
-                }else if(renderBps==4){
-                    int32_t*s32=(int32_t*)renderBuf.data();
-                    for(int i=0;i<inF*outCh;i++)s32[i]=(int32_t)pcm[i]<<16;
-                }else if(renderBps==3){
-                    BYTE*p24=(BYTE*)renderBuf.data();
-                    for(int i=0;i<inF*outCh;i++){p24[i*3]=0;p24[i*3+1]=(BYTE)(pcm[i]&0xFF);p24[i*3+2]=(BYTE)((pcm[i]>>8)&0xFF);}
-                }else{
-                    memcpy(renderBuf.data(),pcm.data(),(size_t)inF*outCh*2);
-                }
-                UINT32 fr=inF;
-                for(int w=0;w<100;w++){UINT32 pad;pAC->GetCurrentPadding(&pad);if(bf-pad>=fr)break;Sleep(2);}
-                UINT32 pad;pAC->GetCurrentPadding(&pad);UINT32 avail=bf-pad;if(fr>avail)fr=avail;if(!fr)continue;
-                BYTE*pO;if(SUCCEEDED(pRC->GetBuffer(fr,&pO))){memcpy(pO,renderBuf.data(),(size_t)fr*frameBytes);pRC->ReleaseBuffer(fr,0);}
-            }
-            pAC->Stop();
-        }
-        if(pRC)pRC->Release();if(pAC)pAC->Release();if(pD)pD->Release();if(pE)pE->Release();
-        CoUninitialize();closesocket(cli);
-    }
-}
-
-void DevListReceiverThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_DEVS);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,1);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int c;if(!RecvAll(cli,(char*)&c,4)){closesocket(cli);continue;}std::vector<std::string>d;for(int i=0;i<c&&i<32;i++){int nl;if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>512)break;if(nl==0){d.push_back("(unknown)");continue;}std::vector<char>nm(nl+1);if(!RecvAll(cli,nm.data(),nl))break;nm[nl]=0;d.push_back(std::string(nm.data()));}g_MicDevs=d;PostMessage(g_hWnd,WM_DEVLIST,0,0);closesocket(cli);}}
-
-void DialogResponseThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_DIALOG);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,5);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int len;if(RecvAll(cli,(char*)&len,4)&&len>0&&len<1024){std::vector<char>buf(len+1);RecvAll(cli,buf.data(),len);buf[len]=0;std::string resp="user clicked "+std::string(buf.data());char*hp=new char[resp.size()+1];strcpy(hp,resp.c_str());PostMessageA(g_hWnd,WM_DIALOG_RESP,0,(LPARAM)hp);}closesocket(cli);}}
-
-void ProcListReceiverThread(){SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT_PROCS);a.sin_addr.s_addr=INADDR_ANY;bind(srv,(sockaddr*)&a,sizeof(a));listen(srv,5);while(true){SOCKET cli=accept(srv,NULL,NULL);if(cli==INVALID_SOCKET)continue;int c;if(!RecvAll(cli,(char*)&c,4)){closesocket(cli);continue;}std::vector<std::string>names;std::vector<DWORD>pids;for(int i=0;i<c&&i<512;i++){DWORD pid;if(!RecvAll(cli,(char*)&pid,4))break;int nl;if(!RecvAll(cli,(char*)&nl,4)||nl<0||nl>256)break;std::string nm;if(nl>0){std::vector<char>buf(nl+1);if(!RecvAll(cli,buf.data(),nl))break;buf[nl]=0;nm=std::string(buf.data());}names.push_back(nm);pids.push_back(pid);}g_ProcPIDs=pids;char**arr=new char*[names.size()];for(size_t i=0;i<names.size();i++){arr[i]=new char[names[i].size()+1];strcpy(arr[i],names[i].c_str());}PostMessage(g_hWnd,WM_PROCLIST,(WPARAM)names.size(),(LPARAM)arr);closesocket(cli);}}
 
 void PlaySelected(){int sel=(int)SendMessageA(g_hListBox,LB_GETCURSEL,0,0);if(sel==LB_ERR||sel>=(int)g_Sounds.size())return;std::string f=g_Sounds[sel];if(f.find('\\')==std::string::npos){char d[MAX_PATH];GetCurrentDirectoryA(MAX_PATH,d);f=std::string(d)+"\\"+f;}SendPlay(f);}
 void SendPopup(){char mb[512]={};GetWindowTextA(g_hMsgEdit,mb,512);std::string msg(mb);int c=(int)SendMessageA(g_hBtnCombo,CB_GETCURSEL,0,0)+1;std::vector<std::string>btns;char b1[128]={},b2[128]={},b3[128]={};GetWindowTextA(g_hBtnEdit1,b1,128);btns.push_back(b1);if(c>=2){GetWindowTextA(g_hBtnEdit2,b2,128);btns.push_back(b2);}if(c>=3){GetWindowTextA(g_hBtnEdit3,b3,128);btns.push_back(b3);}SendDialog(msg,btns);}
@@ -372,7 +423,7 @@ void FindMP3s(){WIN32_FIND_DATAA fd;HANDLE h=FindFirstFileA("*.mp3",&fd);if(h==I
 
 int main(){
     WSADATA wsa;if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 1;Gdiplus::GdiplusStartupInput gdip;ULONG_PTR gt;Gdiplus::GdiplusStartup(&gt,&gdip,0);INITCOMMONCONTROLSEX icex={sizeof(icex),ICC_BAR_CLASSES};InitCommonControlsEx(&icex);FindMP3s();
-    std::thread(FrameThread).detach();std::thread(AudioReceiverThread).detach();std::thread(DevListReceiverThread).detach();std::thread(DialogResponseThread).detach();std::thread(ProcListReceiverThread).detach();
+    std::thread(ListenerThread).detach();
     WNDCLASSEXA wc={sizeof(wc)};wc.lpfnWndProc=WndProc;wc.hInstance=GetModuleHandle(0);wc.hCursor=LoadCursor(0,IDC_ARROW);wc.lpszClassName="NyxServer";RegisterClassExA(&wc);
     g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW|WS_VSCROLL,CW_USEDEFAULT,0,1040,1020,0,0,wc.hInstance,0);ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
     MSG msg;while(GetMessage(&msg,0,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}Gdiplus::GdiplusShutdown(gt);WSACleanup();return 0;
