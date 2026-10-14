@@ -446,8 +446,14 @@ void BuildControls(HWND hwnd){
     s_fontLabel=CreateFontW(13,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     s_fontSmall=CreateFontW(12,0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
     s_brPanel=CreateSolidBrush(C_PANEL);s_brList=CreateSolidBrush(C_LISTBG);s_brDisplay=CreateSolidBrush(C_DISPLAY);
-    const int x=18,w=PANEL_W-36; int y=14;
-
+    
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int rightX = rc.right - PANEL_W + 18;
+    int w = PANEL_W - 36;
+    
+    // --- LEFT PANEL ---
+    int x=18; int y=14;
     HWND hT=CreateWindowExW(0,L"STATIC",L"NYX REMOTE",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,28,hwnd,0,0,0);SendMessage(hT,WM_SETFONT,(WPARAM)s_fontTitle,0);y+=46;
     HWND hPC=CreateWindowExW(0,L"STATIC",L"PC SELECT",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hPC,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
     g_hPcCombo=CreateWindowExW(0,L"COMBOBOX",L"",WS_CHILD|WS_VISIBLE|CBS_DROPDOWNLIST|WS_VSCROLL,x,y,w,200,hwnd,(HMENU)ID_PC_COMBO,0,0);SendMessage(g_hPcCombo,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hPcCombo,L"",L"");y+=36;
@@ -477,12 +483,15 @@ void BuildControls(HWND hwnd){
     HWND hPR=CreateWindowExW(0,L"STATIC",L"PROCESSES",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hPR,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
     g_hProcList=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,x,y,w,120,hwnd,(HMENU)ID_PROC_LIST,0,0);SendMessage(g_hProcList,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcList,L"",L"");y+=128;
     int tw=(w-12)/3;g_hProcRefresh=CreateWindowExW(0,L"BUTTON",L"\u21BB  Refresh",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,tw*2+6,28,hwnd,(HMENU)ID_PROC_REFRESH,0,0);SendMessage(g_hProcRefresh,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcRefresh,L"",L"");
-    g_hProcKill=CreateWindowExW(0,L"BUTTON",L"\u2716  Kill",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+tw*2+12,y,tw,28,hwnd,(HMENU)ID_PROC_KILL,0,0);SendMessage(g_hProcKill,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcKill,L"",L"");y+=40;
+    g_hProcKill=CreateWindowExW(0,L"BUTTON",L"\u2716  Kill",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+tw*2+12,y,tw,28,hwnd,(HMENU)ID_PROC_KILL,0,0);SendMessage(g_hProcKill,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcKill,L"",L"");
 
-    // File Manager UI
+    // --- RIGHT PANEL (FILE MANAGER) ---
+    x = rightX; y = 14;
     HWND hFM=CreateWindowExW(0,L"STATIC",L"FILE MANAGER",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hFM,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
     g_hPathEdit=CreateWindowExW(WS_EX_STATICEDGE,L"EDIT",L"C:\\",WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,x,y,w,22,hwnd,(HMENU)ID_PATH_EDIT,0,0);SendMessage(g_hPathEdit,WM_SETFONT,(WPARAM)s_fontSmall,0);y+=28;
-    g_hFileList=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,x,y,w,160,hwnd,(HMENU)ID_FILE_LIST,0,0);SendMessage(g_hFileList,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileList,L"",L"");y+=168;
+    
+    int listH = rc.bottom - y - 120; // Leaves exactly 120px for the buttons at the bottom
+    g_hFileList=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,x,y,w,listH,hwnd,(HMENU)ID_FILE_LIST,0,0);SendMessage(g_hFileList,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileList,L"",L"");y+=listH+8;
     
     int fw=(w-12)/2;
     g_hFileRefresh=CreateWindowExW(0,L"BUTTON",L"\u21BB Refresh",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,fw,28,hwnd,(HMENU)ID_FILE_REFRESH,0,0);SendMessage(g_hFileRefresh,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileRefresh,L"",L"");
@@ -497,7 +506,20 @@ void BuildControls(HWND hwnd){
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
     case WM_CREATE:BuildControls(hwnd);return 0;
-    case WM_ERASEBKGND:{HDC hdc=(HDC)wp;RECT rc;GetClientRect(hwnd,&rc);RECT p={0,0,PANEL_W,rc.bottom},d={PANEL_W,0,rc.right,rc.bottom};FillRect(hdc,&p,s_brPanel);FillRect(hdc,&d,s_brDisplay);HPEN pen=CreatePen(PS_SOLID,1,C_LINE),old=(HPEN)SelectObject(hdc,pen);MoveToEx(hdc,PANEL_W,0,NULL);LineTo(hdc,PANEL_W,rc.bottom);SelectObject(hdc,old);DeleteObject(pen);return 1;}
+    case WM_ERASEBKGND:{
+        HDC hdc=(HDC)wp;RECT rc;GetClientRect(hwnd,&rc);
+        RECT p={0,0,PANEL_W,rc.bottom};
+        RECT r={rc.right-PANEL_W,0,rc.right,rc.bottom};
+        RECT d={PANEL_W,0,rc.right-PANEL_W,rc.bottom};
+        FillRect(hdc,&p,s_brPanel);
+        FillRect(hdc,&r,s_brPanel);
+        FillRect(hdc,&d,s_brDisplay);
+        HPEN pen=CreatePen(PS_SOLID,1,C_LINE),old=(HPEN)SelectObject(hdc,pen);
+        MoveToEx(hdc,PANEL_W,0,NULL);LineTo(hdc,PANEL_W,rc.bottom);
+        MoveToEx(hdc,rc.right-PANEL_W,0,NULL);LineTo(hdc,rc.right-PANEL_W,rc.bottom);
+        SelectObject(hdc,old);DeleteObject(pen);
+        return 1;
+    }
     case WM_CTLCOLORSTATIC:{HDC hdc=(HDC)wp;HWND ctl=(HWND)lp;if(ctl==g_hStatus){bool ok;{std::lock_guard<std::mutex>lk(g_SockLock);ok=(g_Client!=INVALID_SOCKET);}SetTextColor(hdc,ok?C_GREEN:C_AMBER);}else if(ctl==g_hResponse)SetTextColor(hdc,C_CYAN);else SetTextColor(hdc,C_TEXT);SetBkMode(hdc,TRANSPARENT);return(LRESULT)s_brPanel;}
     case WM_CTLCOLORLISTBOX:{HDC hdc=(HDC)wp;SetTextColor(hdc,C_TEXT);SetBkColor(hdc,C_LISTBG);return(LRESULT)s_brList;}
     case WM_CTLCOLOREDIT:{HDC hdc=(HDC)wp;SetTextColor(hdc,C_TEXT);SetBkColor(hdc,C_LISTBG);return(LRESULT)s_brList;}
@@ -636,15 +658,24 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         {std::lock_guard<std::mutex>dlk(g_DecodedLock);bmp=g_DecodedFrame;}
         if(bmp&&bmp->GetLastStatus()==Gdiplus::Ok){
             int bw=bmp->GetWidth(),bh=bmp->GetHeight(),pad=10;
-            int ax=PANEL_W+pad,ay=pad,aw=rc.right-ax-pad,ah=rc.bottom-ay-pad;
+            int ax=PANEL_W+pad,ay=pad;
+            int aw=rc.right-PANEL_W-pad-ax; // Viewport width between the two panels
+            int ah=rc.bottom-ay-pad;
             if(aw>0&&ah>0&&bw>0&&bh>0){
                 float sc=min((float)aw/bw,(float)ah/bh);int dw=(int)(bw*sc),dh=(int)(bh*sc);int dx=ax+(aw-dw)/2,dy=ay+(ah-dh)/2;
                 g_ImgW=bw;g_ImgH=bh;g_DispX=dx;g_DispY=dy;g_DispW=dw;g_DispH=dh;
-                Gdiplus::Graphics g(hdc);Gdiplus::SolidBrush br(Gdiplus::Color(20,20,24));g.FillRectangle(&br,dx-2,dy-2,dw+4,dh+4);g.DrawImage(bmp,dx,dy,dw,dh);
+                Gdiplus::Graphics g(hdc);Gdiplus::SolidBrush br(Gdiplus::Color(20,20,24));
+                g.FillRectangle(&br,ax,ay,aw,ah); // Fill viewport background
+                g.FillRectangle(&br,dx-2,dy-2,dw+4,dh+4);g.DrawImage(bmp,dx,dy,dw,dh);
                 if(g_FullCtrl){Gdiplus::Pen pen(Gdiplus::Color(220,80,80),2);g.DrawRectangle(&pen,dx-1,dy-1,dw+2,dh+2);}
             }
         } else {
-            g_ImgW=0;SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,C_DIM);HFONT old=(HFONT)SelectObject(hdc,s_fontLabel);const char*t="Waiting for screen data...";TextOutA(hdc,PANEL_W+(rc.right-PANEL_W-220)/2,rc.bottom/2-8,t,(int)strlen(t));SelectObject(hdc,old);
+            g_ImgW=0;
+            int vpW = rc.right - PANEL_W*2;
+            SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,C_DIM);HFONT old=(HFONT)SelectObject(hdc,s_fontLabel);
+            const char*t="Waiting for screen data...";
+            TextOutA(hdc,PANEL_W+(vpW-220)/2,rc.bottom/2-8,t,(int)strlen(t));
+            SelectObject(hdc,old);
         }
         EndPaint(hwnd,&ps);return 0;}
     case WM_DESTROY:
@@ -660,6 +691,9 @@ int main(){
     WSADATA wsa;if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 1;Gdiplus::GdiplusStartupInput gdip;ULONG_PTR gt;Gdiplus::GdiplusStartup(&gt,&gdip,0);INITCOMMONCONTROLSEX icex={sizeof(icex),ICC_BAR_CLASSES};InitCommonControlsEx(&icex);FindMP3s();
     std::thread(ListenerThread).detach();
     WNDCLASSEXA wc={sizeof(wc)};wc.lpfnWndProc=WndProc;wc.hInstance=GetModuleHandle(0);wc.hCursor=LoadCursor(0,IDC_ARROW);wc.lpszClassName="NyxServer";RegisterClassExA(&wc);
-    g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,0,1040,1400,0,0,wc.hInstance,0);ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
+    
+    // Width increased to 1320 to comfortably fit Left Panel (264) + Viewport (~792) + Right Panel (264)
+    g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,0,1320,1020,0,0,wc.hInstance,0);
+    ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
     MSG msg;while(GetMessage(&msg,0,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}Gdiplus::GdiplusShutdown(gt);WSACleanup();return 0;
 }
