@@ -188,8 +188,13 @@ void SendDeviceList(){
     CoInitialize(0);IMMDeviceEnumerator*pE=NULL;CoCreateInstance(__uuidof(MMDeviceEnumerator),0,CLSCTX_ALL,__uuidof(IMMDeviceEnumerator),(void**)&pE);IMMDeviceCollection*pC=NULL;pE->EnumAudioEndpoints(eCapture,DEVICE_STATE_ACTIVE,&pC);UINT cnt=0;pC->GetCount(&cnt);int n=(int)cnt;SendAll(s,(char*)&n,4);for(int i=0;i<n;i++){IMMDevice*pD=NULL;pC->Item(i,&pD);IPropertyStore*pS=NULL;pD->OpenPropertyStore(STGM_READ,&pS);PROPVARIANT nm;ZeroMemory(&nm,sizeof(nm));pS->GetValue(s_PKEY_FriendlyName,&nm);char buf[256]={};if(nm.vt==VT_LPWSTR&&nm.pwszVal)WideCharToMultiByte(CP_ACP,0,nm.pwszVal,-1,buf,255,"?",NULL);int len=(int)strlen(buf);SendAll(s,(char*)&len,4);SendAll(s,buf,len);if(nm.vt==VT_LPWSTR&&nm.pwszVal)CoTaskMemFree(nm.pwszVal);pS->Release();pD->Release();}pC->Release();pE->Release();CoUninitialize();closesocket(s);
 }
 
-// --- NEW FILE MANAGER FUNCTIONS ---
-void SendFileListResponse(SOCKET s, const std::string& path) {
+// --- FILE MANAGER RESPONSES (Uses separate CH_FILE connections to prevent corrupting the video stream) ---
+void SendFileListResponseThread(std::string path) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(PORT); inet_pton(AF_INET, GetServerIP(), &a.sin_addr);
+    if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return; }
+    unsigned char ch = CH_FILE; send(s, (char*)&ch, 1, 0);
+    
     std::vector<std::pair<std::string, bool>> items;
     std::vector<int64_t> sizes;
     std::string search = path;
@@ -201,7 +206,7 @@ void SendFileListResponse(SOCKET s, const std::string& path) {
         do {
             if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) continue;
             bool isDir = (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-            items.push_back({fd.cFileName, isDir});
+            items.push_back({ fd.cFileName, isDir });
             int64_t sz = isDir ? 0 : ((int64_t)fd.nFileSizeHigh << 32 | fd.nFileSizeLow);
             sizes.push_back(sz);
         } while (FindNextFileA(h, &fd));
@@ -215,13 +220,19 @@ void SendFileListResponse(SOCKET s, const std::string& path) {
         if (nl > 0) SendAll(s, items[i].first.c_str(), nl);
         SendAll(s, (char*)&sizes[i], 8);
     }
+    closesocket(s);
 }
 
-void SendFileDownloadResponse(SOCKET s, const std::string& path) {
+void SendFileDownloadResponseThread(std::string path) {
+    SOCKET s = socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in a{}; a.sin_family = AF_INET; a.sin_port = htons(PORT); inet_pton(AF_INET, GetServerIP(), &a.sin_addr);
+    if (connect(s, (sockaddr*)&a, sizeof(a)) != 0) { closesocket(s); return; }
+    unsigned char ch = CH_FILE; send(s, (char*)&ch, 1, 0);
+
     int type = 1; SendAll(s, (char*)&type, 4);
     HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
     if (hFile == INVALID_HANDLE_VALUE) {
-        int64_t sz = -1; SendAll(s, (char*)&sz, 8); return;
+        int64_t sz = -1; SendAll(s, (char*)&sz, 8); closesocket(s); return;
     }
     LARGE_INTEGER li; GetFileSizeEx(hFile, &li);
     int64_t sz = li.QuadPart; SendAll(s, (char*)&sz, 8);
@@ -234,19 +245,7 @@ void SendFileDownloadResponse(SOCKET s, const std::string& path) {
         sz -= read;
     }
     CloseHandle(hFile);
-}
-
-void ReceiveFileUpload(SOCKET s, const std::string& path, int64_t size) {
-    HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return;
-    char buf[65536];
-    while (size > 0) {
-        int toRead = (size > sizeof(buf)) ? sizeof(buf) : (int)size;
-        if (!RecvAll(s, buf, toRead)) break;
-        DWORD written; WriteFile(hFile, buf, toRead, &written, NULL);
-        size -= toRead;
-    }
-    CloseHandle(hFile);
+    closesocket(s);
 }
 
 void CommandListener(SOCKET s){
@@ -269,13 +268,13 @@ void CommandListener(SOCKET s){
         else if(cmd=='w'){int delta;if(!RecvAll(s,(char*)&delta,4))break;INPUT inp={};inp.type=INPUT_MOUSE;inp.mi.dwFlags=MOUSEEVENTF_WHEEL;inp.mi.mouseData=(DWORD)delta;SendInput(1,&inp,sizeof(INPUT));}
         else if(cmd=='D'){int ml;if(!RecvAll(s,(char*)&ml,4))break;std::string msg;if(ml>0){std::vector<char>mb(ml);if(!RecvAll(s,mb.data(),ml))break;mb.push_back(0);msg=std::string(mb.data());}int nb;if(!RecvAll(s,(char*)&nb,4))break;g_DlgInfo.message=msg;g_DlgInfo.count=0;for(int i=0;i<nb&&i<3;i++){int bl;if(!RecvAll(s,(char*)&bl,4))break;std::string btn;if(bl>0){std::vector<char>bb(bl);if(!RecvAll(s,bb.data(),bl))break;bb.push_back(0);btn=std::string(bb.data());}g_DlgInfo.buttons[g_DlgInfo.count++]=btn;}std::thread([](){ShowDialogThread();}).detach();}
         
-        // --- NEW FILE MANAGER COMMANDS ---
+        // --- FILE MANAGER COMMANDS ---
         else if(cmd=='I'){
             char sub; if(recv(s,&sub,1,0)!=1)break;
             if(sub=='L'){
                 int pl; if(!RecvAll(s,(char*)&pl,4))break;
                 std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
-                SendFileListResponse(s, path);
+                std::thread(SendFileListResponseThread, path).detach(); // Spawns separate connection
             } else if(sub=='D'){
                 int pl; if(!RecvAll(s,(char*)&pl,4))break;
                 std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
@@ -288,11 +287,21 @@ void CommandListener(SOCKET s){
                 int pl; if(!RecvAll(s,(char*)&pl,4))break;
                 std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
                 int64_t fsize; if(!RecvAll(s,(char*)&fsize,8))break;
-                ReceiveFileUpload(s, path, fsize);
+                HANDLE hFile = CreateFileA(path.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+                if (hFile != INVALID_HANDLE_VALUE) {
+                    char buf[65536];
+                    while (fsize > 0) {
+                        int toRead = (fsize > sizeof(buf)) ? sizeof(buf) : (int)fsize;
+                        if (!RecvAll(s, buf, toRead)) break;
+                        DWORD written; WriteFile(hFile, buf, toRead, &written, NULL);
+                        fsize -= toRead;
+                    }
+                    CloseHandle(hFile);
+                }
             } else if(sub=='W'){
                 int pl; if(!RecvAll(s,(char*)&pl,4))break;
                 std::string path; if(pl>0){std::vector<char>b(pl);RecvAll(s,b.data(),pl);path=std::string(b.data(),pl);}
-                SendFileDownloadResponse(s, path);
+                std::thread(SendFileDownloadResponseThread, path).detach(); // Spawns separate connection
             }
         }
     }
@@ -332,7 +341,8 @@ int main(){
                     STATSTG st;strm->Stat(&st,STATFLAG_NONAME);ULONG len=st.cbSize.LowPart;BYTE*data=new BYTE[len];LARGE_INTEGER li{};strm->Seek(li,STREAM_SEEK_SET,0);ULONG rd;strm->Read(data,len,&rd);strm->Release();
                     bool ok=SendAll(sock,(char*)&len,4)&&SendAll(sock,(char*)data,len);
                     delete[]data;if(!ok){g_Connected=false;break;}
-                    Sleep(33); // Optimized from 150ms to ~30 FPS
+                    
+                    Sleep(100); // Reverted to 100ms (~10 FPS) to prevent freezing over the internet
                 } else {
                     Sleep(100);
                 }
